@@ -7,11 +7,11 @@ use std::os::unix::io::RawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
-use common::{Body, Version};
-pub use common::{ConnectionError, RequestError, ServerError};
-use connection::HttpConnection;
-use request::Request;
-use response::{Response, StatusCode};
+use crate::common::{Body, Version};
+pub use crate::common::{ConnectionError, RequestError, ServerError};
+use crate::connection::HttpConnection;
+use crate::request::Request;
+use crate::response::{Response, StatusCode};
 use std::collections::HashMap;
 
 use utils::epoll;
@@ -129,13 +129,10 @@ impl<T: Read + Write> ClientConnection<T> {
 
                 // Send an error response for the request that gave us the error.
                 let mut error_response = Response::new(Version::Http11, StatusCode::BadRequest);
-                error_response.set_body(Body::new(
-                    format!(
-                        "{{ \"error\": \"{}\nAll previous unanswered requests will be dropped.\" }}",
-                        inner.to_string()
-                    )
-                    .to_string(),
-                ));
+                error_response.set_body(Body::new(format!(
+                    "{{ \"error\": \"{}\nAll previous unanswered requests will be dropped.\" }}",
+                    inner.to_string()
+                )));
                 self.connection.enqueue_response(error_response);
             }
             Err(ConnectionError::InvalidWrite) => {
@@ -149,7 +146,10 @@ impl<T: Read + Write> ClientConnection<T> {
                 }
             }
         }
-        self.in_flight_response_count += parsed_requests.len() as u32;
+        self.in_flight_response_count = self
+            .in_flight_response_count
+            .checked_add(parsed_requests.len() as u32)
+            .ok_or(ServerError::Overflow)?;
         // If the state of the connection has changed, we need to update
         // the event set in the `epoll` structure.
         if self.connection.pending_write() {
@@ -181,11 +181,15 @@ impl<T: Read + Write> ClientConnection<T> {
         Ok(())
     }
 
-    fn enqueue_response(&mut self, response: Response) {
+    fn enqueue_response(&mut self, response: Response) -> Result<()> {
         if self.state != ClientConnectionState::Closed {
             self.connection.enqueue_response(response);
         }
-        self.in_flight_response_count -= 1;
+        self.in_flight_response_count = self
+            .in_flight_response_count
+            .checked_sub(1)
+            .ok_or(ServerError::Underflow)?;
+        Ok(())
     }
 
     // Returns `true` if the connection is closed and safe to drop.
@@ -300,10 +304,11 @@ impl HttpServer {
         // current thread until at least one event is received.
         // The received notifications will then populate the `events` array with
         // `event_count` elements, where 1 <= event_count <= MAX_CONNECTIONS.
-        let event_count = self
-            .epoll
-            .wait(MAX_CONNECTIONS, -1, &mut events[..])
-            .map_err(ServerError::IOError)?;
+        let event_count = match self.epoll.wait(MAX_CONNECTIONS, -1, &mut events[..]) {
+            Ok(event_count) => event_count,
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => 0,
+            Err(e) => return Err(ServerError::IOError(e)),
+        };
         // We use `take()` on the iterator over `events` as, even though only
         // `events_count` events have been inserted into `events`, the size of
         // the array is still `MAX_CONNECTIONS`, so we discard empty elements
@@ -383,8 +388,6 @@ impl HttpServer {
     ///
     /// ## Non-blocking server
     /// ```
-    /// extern crate utils;
-    ///
     /// use std::os::unix::io::AsRawFd;
     ///
     /// use micro_http::{HttpServer, Response, StatusCode};
@@ -404,7 +407,7 @@ impl HttpServer {
     /// epoll.ctl(
     ///     epoll::ControlOperation::Add,
     ///     server.epoll().as_raw_fd(),
-    ///     &epoll::EpollEvent::new(epoll::EventSet::IN, 1234u64),
+    ///     epoll::EpollEvent::new(epoll::EventSet::IN, 1234u64),
     /// )
     /// .unwrap();
     ///
@@ -452,6 +455,7 @@ impl HttpServer {
     ///
     /// # Errors
     /// `IOError` is returned when an `epoll::ctl` operation fails.
+    /// `Underflow` is returned when `enqueue_response` fails.
     pub fn respond(&mut self, response: ServerResponse) -> Result<()> {
         if let Some(client_connection) = self.connections.get_mut(&(response.id as i32)) {
             // If the connection was incoming before we enqueue the response, we change its
@@ -460,7 +464,7 @@ impl HttpServer {
                 client_connection.state = ClientConnectionState::AwaitingOutgoing;
                 Self::epoll_mod(&self.epoll, response.id as RawFd, epoll::EventSet::OUT)?;
             }
-            client_connection.enqueue_response(response.response);
+            client_connection.enqueue_response(response.response)?;
         }
         Ok(())
     }
@@ -507,7 +511,7 @@ impl HttpServer {
     fn epoll_mod(epoll: &epoll::Epoll, stream_fd: RawFd, evset: epoll::EventSet) -> Result<()> {
         let event = epoll::EpollEvent::new(evset, stream_fd as u64);
         epoll
-            .ctl(epoll::ControlOperation::Modify, stream_fd, &event)
+            .ctl(epoll::ControlOperation::Modify, stream_fd, event)
             .map_err(ServerError::IOError)
     }
 
@@ -520,7 +524,7 @@ impl HttpServer {
             .ctl(
                 epoll::ControlOperation::Add,
                 stream_fd,
-                &epoll::EpollEvent::new(epoll::EventSet::IN, stream_fd as u64),
+                epoll::EpollEvent::new(epoll::EventSet::IN, stream_fd as u64),
             )
             .map_err(ServerError::IOError)
     }
@@ -529,22 +533,27 @@ impl HttpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
-    use common::Body;
+    use crate::common::Body;
+    use utils::tempfile::TempFile;
+
+    fn get_temp_socket_file() -> TempFile {
+        let mut path_to_socket = TempFile::new().unwrap();
+        path_to_socket.remove().unwrap();
+        path_to_socket
+    }
 
     #[test]
     fn test_wait_one_connection() {
-        let path_to_socket = "/tmp/test_socket_http_server1.sock";
-        fs::remove_file(path_to_socket).unwrap_or_default();
+        let path_to_socket = get_temp_socket_file();
 
-        let mut server = HttpServer::new(path_to_socket.to_string()).unwrap();
+        let mut server = HttpServer::new(path_to_socket.as_path()).unwrap();
         server.start_server().unwrap();
 
         // Test one incoming connection.
-        let mut socket = UnixStream::connect(path_to_socket).unwrap();
+        let mut socket = UnixStream::connect(path_to_socket.as_path()).unwrap();
         assert!(server.requests().unwrap().is_empty());
 
         socket
@@ -570,19 +579,17 @@ mod tests {
 
         let mut buf: [u8; 1024] = [0; 1024];
         assert!(socket.read(&mut buf[..]).unwrap() > 0);
-        fs::remove_file(path_to_socket).unwrap();
     }
 
     #[test]
     fn test_wait_concurrent_connections() {
-        let path_to_socket = "/tmp/test_socket_http_server2.sock";
-        fs::remove_file(path_to_socket).unwrap_or_default();
+        let path_to_socket = get_temp_socket_file();
 
-        let mut server = HttpServer::new(path_to_socket.to_string()).unwrap();
+        let mut server = HttpServer::new(path_to_socket.as_path()).unwrap();
         server.start_server().unwrap();
 
         // Test two concurrent connections.
-        let mut first_socket = UnixStream::connect(path_to_socket).unwrap();
+        let mut first_socket = UnixStream::connect(path_to_socket.as_path()).unwrap();
         assert!(server.requests().unwrap().is_empty());
 
         first_socket
@@ -592,7 +599,7 @@ mod tests {
                                Content-Type: application/json\r\n\r\nwhatever body",
             )
             .unwrap();
-        let mut second_socket = UnixStream::connect(path_to_socket).unwrap();
+        let mut second_socket = UnixStream::connect(path_to_socket.as_path()).unwrap();
 
         let mut req_vec = server.requests().unwrap();
         let server_request = req_vec.remove(0);
@@ -644,19 +651,17 @@ mod tests {
         assert!(second_socket.read(&mut buf[..]).unwrap() > 0);
         second_socket.shutdown(std::net::Shutdown::Both).unwrap();
         assert!(server.requests().unwrap().is_empty());
-        fs::remove_file(path_to_socket).unwrap();
     }
 
     #[test]
     fn test_wait_expect_connection() {
-        let path_to_socket = "/tmp/test_socket_http_server3.sock";
-        fs::remove_file(path_to_socket).unwrap_or_default();
+        let path_to_socket = get_temp_socket_file();
 
-        let mut server = HttpServer::new(path_to_socket.to_string()).unwrap();
+        let mut server = HttpServer::new(path_to_socket.as_path()).unwrap();
         server.start_server().unwrap();
 
         // Test one incoming connection with `Expect: 100-continue`.
-        let mut socket = UnixStream::connect(path_to_socket).unwrap();
+        let mut socket = UnixStream::connect(path_to_socket.as_path()).unwrap();
         assert!(server.requests().unwrap().is_empty());
 
         socket
@@ -695,42 +700,37 @@ mod tests {
 
         let mut buf: [u8; 1024] = [0; 1024];
         assert!(socket.read(&mut buf[..]).unwrap() > 0);
-        fs::remove_file(path_to_socket).unwrap();
     }
 
     #[test]
     fn test_wait_many_connections() {
-        let path_to_socket = "/tmp/test_socket_http_server4.sock";
-        fs::remove_file(path_to_socket).unwrap_or_default();
+        let path_to_socket = get_temp_socket_file();
 
-        let mut server = HttpServer::new(path_to_socket.to_string()).unwrap();
+        let mut server = HttpServer::new(path_to_socket.as_path()).unwrap();
         server.start_server().unwrap();
 
         let mut sockets: Vec<UnixStream> = Vec::with_capacity(11);
         for _ in 0..MAX_CONNECTIONS {
-            sockets.push(UnixStream::connect(path_to_socket).unwrap());
+            sockets.push(UnixStream::connect(path_to_socket.as_path()).unwrap());
             assert!(server.requests().unwrap().is_empty());
         }
 
-        sockets.push(UnixStream::connect(path_to_socket).unwrap());
+        sockets.push(UnixStream::connect(path_to_socket.as_path()).unwrap());
         assert!(server.requests().unwrap().is_empty());
         let mut buf: [u8; 120] = [0; 120];
         sockets[MAX_CONNECTIONS].read_exact(&mut buf).unwrap();
         assert_eq!(&buf[..], SERVER_FULL_ERROR_MESSAGE);
-
-        fs::remove_file(path_to_socket).unwrap();
     }
 
     #[test]
     fn test_wait_parse_error() {
-        let path_to_socket = "/tmp/test_socket_http_server5.sock";
-        fs::remove_file(path_to_socket).unwrap_or_default();
+        let path_to_socket = get_temp_socket_file();
 
-        let mut server = HttpServer::new(path_to_socket.to_string()).unwrap();
+        let mut server = HttpServer::new(path_to_socket.as_path()).unwrap();
         server.start_server().unwrap();
 
         // Test one incoming connection.
-        let mut socket = UnixStream::connect(path_to_socket).unwrap();
+        let mut socket = UnixStream::connect(path_to_socket.as_path()).unwrap();
         socket.set_nonblocking(true).unwrap();
         assert!(server.requests().unwrap().is_empty());
 
@@ -744,31 +744,28 @@ mod tests {
 
         assert!(server.requests().unwrap().is_empty());
         assert!(server.requests().unwrap().is_empty());
-        let mut buf: [u8; 198] = [0; 198];
+        let mut buf: [u8; 255] = [0; 255];
         assert!(socket.read(&mut buf[..]).unwrap() > 0);
         let error_message = b"HTTP/1.1 400 \r\n\
                               Server: Firecracker API\r\n\
                               Connection: keep-alive\r\n\
                               Content-Type: application/json\r\n\
-                              Content-Length: 80\r\n\r\n{ \"error\": \"Invalid header.\n\
-                              All previous unanswered requests will be dropped.\" }";
+                              Content-Length: 136\r\n\r\n{ \"error\": \"Invalid header. \
+                              Reason: Invalid value. Key:Content-Length; Value: alpha\nAll previous unanswered requests will be dropped.\" }";
         assert_eq!(&buf[..], &error_message[..]);
-
-        fs::remove_file(path_to_socket).unwrap();
     }
 
     #[test]
     fn test_wait_in_flight_responses() {
-        let path_to_socket = "/tmp/test_socket_http_server6.sock";
-        fs::remove_file(path_to_socket).unwrap_or_default();
+        let path_to_socket = get_temp_socket_file();
 
-        let mut server = HttpServer::new(path_to_socket.to_string()).unwrap();
+        let mut server = HttpServer::new(path_to_socket.as_path()).unwrap();
         server.start_server().unwrap();
 
         // Test a connection dropped and then a new one appearing
         // before the user had a chance to send the response to the
         // first one.
-        let mut first_socket = UnixStream::connect(path_to_socket).unwrap();
+        let mut first_socket = UnixStream::connect(path_to_socket.as_path()).unwrap();
         assert!(server.requests().unwrap().is_empty());
 
         first_socket
@@ -784,7 +781,7 @@ mod tests {
 
         first_socket.shutdown(std::net::Shutdown::Both).unwrap();
         assert!(server.requests().unwrap().is_empty());
-        let mut second_socket = UnixStream::connect(path_to_socket).unwrap();
+        let mut second_socket = UnixStream::connect(path_to_socket.as_path()).unwrap();
         second_socket.set_nonblocking(true).unwrap();
         assert!(server.requests().unwrap().is_empty());
 
@@ -836,6 +833,5 @@ mod tests {
         assert!(second_socket.read(&mut buf[..]).unwrap() > 0);
         second_socket.shutdown(std::net::Shutdown::Both).unwrap();
         assert!(server.requests().is_ok());
-        fs::remove_file(path_to_socket).unwrap();
     }
 }

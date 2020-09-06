@@ -37,27 +37,8 @@ The generic requirements are explained below:
      If you need help setting up access to `/dev/kvm`, you should check out
      [Appendix A](#appendix-a-setting-up-kvm-access).
 
-<details>
-
-<summary>Click here to see a BASH script that will check if your system meets
-the basic requirements to run Firecracker.</summary>
-
-```bash
-    err="";
-    [ "$(uname) $(uname -m)" = "Linux x86_64" ]  \
-      || [ "$(uname) $(uname -m)" = "Linux aarch64" ] \
-      || err="ERROR: your system is not Linux x86_64 or Linux aarch64."; \
-    [ -r /dev/kvm ] && [ -w /dev/kvm ] \
-      || err="$err\nERROR: /dev/kvm is innaccessible."; \
-    (( $(uname -r | cut -d. -f1)*1000 + $(uname -r | cut -d. -f2) >= 4014 )) \
-      || err="$err\nERROR: your kernel version ($(uname -r)) is too old."; \
-    dmesg | grep -i "hypervisor detected" \
-      && echo "WARNING: you are running in a virtual machine." \
-      && echo "Firecracker is not well tested under nested virtualization."; \
-    [ -z "$err" ] && echo "Your system looks ready for Firecracker!" || echo -e "$err"
-```
-
-</details>
+To check if your system meets the requirements to run Firecracker, clone
+the repository and execute `tools/devtool checkenv`.
 
 ## Getting the Firecracker Binary
 
@@ -68,11 +49,12 @@ just download the latest binary from our
 and run it on your x86_64 or aarch64 Linux machine.
 
 On the EC2 instance, this binary can be downloaded as:
-```
-latest=$(basename $(curl -fsSLI -o /dev/null -w  %{url_effective}  https://github.com/firecracker-microvm/firecracker/releases/latest))
+
+```wrap
+latest=$(basename $(curl -fsSLI -o /dev/null -w  %{url_effective} https://github.com/firecracker-microvm/firecracker/releases/latest))
 ```
 
-```
+```wrap
 curl -LOJ https://github.com/firecracker-microvm/firecracker/releases/download/${latest}/firecracker-${latest}-$(uname -m)
 ```
 
@@ -138,87 +120,88 @@ In your **second shell** prompt:
 - get the kernel and rootfs, if you don't have any available:
 
   ```bash
-    arch=`uname -m`
-    dest_kernel="hello-vmlinux.bin"
-    dest_rootfs="hello-rootfs.ext4"
-    image_bucket_url="https://s3.amazonaws.com/spec.ccfc.min/img"
+  arch=`uname -m`
+  dest_kernel="hello-vmlinux.bin"
+  dest_rootfs="hello-rootfs.ext4"
+  image_bucket_url="https://s3.amazonaws.com/spec.ccfc.min/img"
 
-    if [ ${arch} = "x86_64" ]; then
-            kernel="${image_bucket_url}/hello/kernel/hello-vmlinux.bin"
-            rootfs="${image_bucket_url}/hello/fsfiles/hello-rootfs.ext4"
-    elif [ ${arch} = "aarch64" ]; then
-            kernel="${image_bucket_url}/aarch64/ubuntu_with_ssh/kernel/vmlinux.bin"
-            rootfs="${image_bucket_url}/aarch64/ubuntu_with_ssh/fsfiles/xenial.rootfs.ext4"
-    else
-            echo "Cannot run firecracker on $arch architecture!"
-            exit 1
-    fi
+  if [ ${arch} = "x86_64" ]; then
+      kernel="${image_bucket_url}/hello/kernel/hello-vmlinux.bin"
+      rootfs="${image_bucket_url}/hello/fsfiles/hello-rootfs.ext4"
+  elif [ ${arch} = "aarch64" ]; then
+      kernel="${image_bucket_url}/aarch64/ubuntu_with_ssh/kernel/vmlinux.bin"
+      rootfs="${image_bucket_url}/aarch64/ubuntu_with_ssh/fsfiles/xenial.rootfs.ext4"
+  else
+      echo "Cannot run firecracker on $arch architecture!"
+      exit 1
+  fi
 
-    echo "Downloading $kernel..."
-    curl -fsSL -o $dest_kernel $kernel
+  echo "Downloading $kernel..."
+  curl -fsSL -o $dest_kernel $kernel
 
-    echo "Downloading $rootfs..."
-    curl -fsSL -o $dest_rootfs $rootfs
+  echo "Downloading $rootfs..."
+  curl -fsSL -o $dest_rootfs $rootfs
 
-    echo "Saved kernel file to $dest_kernel and root block device to $dest_rootfs."
+  echo "Saved kernel file to $dest_kernel and root block device to $dest_rootfs."
   ```
 
-- set the guest kernel (assuming you are in the same directory as the above script was run):
+- set the guest kernel (assuming you are in the same directory as the
+  above script was run):
 
   ```bash
-    arch=`uname -m`
-    kernel_path=$(pwd)"/hello-vmlinux.bin"
+  arch=`uname -m`
+  kernel_path=$(pwd)"/hello-vmlinux.bin"
 
-    if [ ${arch} = "x86_64" ]; then
+  if [ ${arch} = "x86_64" ]; then
       curl --unix-socket /tmp/firecracker.socket -i \
-          -X PUT 'http://localhost/boot-source'   \
-          -H 'Accept: application/json'           \
-          -H 'Content-Type: application/json'     \
-          -d "{
-                \"kernel_image_path\": \"${kernel_path}\",
-                \"boot_args\": \"console=ttyS0 reboot=k panic=1 pci=off\"
-           }"
-    elif [ ${arch} = "aarch64" ]; then
-        curl --unix-socket /tmp/firecracker.socket -i \
-          -X PUT 'http://localhost/boot-source'   \
-          -H 'Accept: application/json'           \
-          -H 'Content-Type: application/json'     \
-          -d "{
-                \"kernel_image_path\": \"${kernel_path}\",
-                \"boot_args\": \"keep_bootcon console=ttyS0 reboot=k panic=1 pci=off\"
-           }"
-    else
-        echo "Cannot run firecracker on $arch architecture!"
-        exit 1
-    fi
+        -X PUT 'http://localhost/boot-source'   \
+        -H 'Accept: application/json'           \
+        -H 'Content-Type: application/json'     \
+        -d "{
+              \"kernel_image_path\": \"${kernel_path}\",
+              \"boot_args\": \"console=ttyS0 reboot=k panic=1 pci=off\"
+         }"
+  elif [ ${arch} = "aarch64" ]; then
+      curl --unix-socket /tmp/firecracker.socket -i \
+        -X PUT 'http://localhost/boot-source'   \
+        -H 'Accept: application/json'           \
+        -H 'Content-Type: application/json'     \
+        -d "{
+              \"kernel_image_path\": \"${kernel_path}\",
+              \"boot_args\": \"keep_bootcon console=ttyS0 reboot=k panic=1 pci=off\"
+         }"
+  else
+      echo "Cannot run firecracker on $arch architecture!"
+      exit 1
+  fi
   ```
 
 - set the guest rootfs:
 
   ```bash
-    rootfs_path=$(pwd)"/hello-rootfs.ext4"
-    curl --unix-socket /tmp/firecracker.socket -i \
-      -X PUT 'http://localhost/drives/rootfs' \
-      -H 'Accept: application/json'           \
-      -H 'Content-Type: application/json'     \
-      -d "{
-            \"drive_id\": \"rootfs\",
-            \"path_on_host\": \"${rootfs_path}\",
-            \"is_root_device\": true,
-            \"is_read_only\": false
-       }"
+  rootfs_path=$(pwd)"/hello-rootfs.ext4"
+  curl --unix-socket /tmp/firecracker.socket -i \
+    -X PUT 'http://localhost/drives/rootfs' \
+    -H 'Accept: application/json'           \
+    -H 'Content-Type: application/json'     \
+    -d "{
+          \"drive_id\": \"rootfs\",
+          \"path_on_host\": \"${rootfs_path}\",
+          \"is_root_device\": true,
+          \"is_read_only\": false
+     }"
   ```
 
 - start the guest machine:
 
   ```bash
   curl --unix-socket /tmp/firecracker.socket -i \
-      -X PUT 'http://localhost/actions'       \
-      -H  'Accept: application/json'          \
-      -H  'Content-Type: application/json'    \
-      -d '{
-          "action_type": "InstanceStart"
-       }'
+    -X PUT 'http://localhost/actions'       \
+    -H  'Accept: application/json'          \
+    -H  'Content-Type: application/json'    \
+    -d '{
+        "action_type": "InstanceStart"
+     }'
   ```
 
 Going back to your first shell, you should now see a serial TTY prompting you
@@ -235,38 +218,38 @@ the `InstanceStart` call, via this API command:
 
 ```bash
 curl --unix-socket /tmp/firecracker.socket -i  \
-    -X PUT 'http://localhost/machine-config' \
-    -H 'Accept: application/json'            \
-    -H 'Content-Type: application/json'      \
-    -d '{
-        "vcpu_count": 2,
-        "mem_size_mib": 1024,
-        "ht_enabled": false
-    }'
+  -X PUT 'http://localhost/machine-config' \
+  -H 'Accept: application/json'            \
+  -H 'Content-Type: application/json'      \
+  -d '{
+      "vcpu_count": 2,
+      "mem_size_mib": 1024,
+      "ht_enabled": false
+  }'
 ```
 
-#### Configuring the microVM without sending API requests
+### Configuring the microVM without sending API requests
 
-If you'd like to boot up a guest machine without using the API socket, you can do that
-by passing the parameter `--config-file` to the Firecracker process. The command for
-starting Firecracker with this option will look like this:
+If you'd like to boot up a guest machine without using the API socket, you can
+do that by passing the parameter `--config-file` to the Firecracker process.
+The command for starting Firecracker with this option will look like this:
 
-```bash
-./firecracker --api-sock /tmp/firecracker.socket --config-file
-<path_to_the_configuration_file>
+```wrap
+./firecracker --api-sock /tmp/firecracker.socket --config-file <path_to_the_configuration_file>
 ```
 
-`path_to_the_configuration_file` should represent the path to a file that contains a
-JSON which stores the entire configuration for all of the microVM's resources. The
-JSON **must** contain the configuration for the guest kernel and rootfs, as these
-are mandatory, but all of the other resources are optional, so it's your choice
-if you want to configure them or not. Because using this configuration method will
-also start the microVM, you need to specify all desired pre-boot configurable resources
-in that JSON. The names of the resources are the ones from the `firecracker.yaml` file
-and the names of their fields are the same that are used in API requests.
-You can find an example of configuration file at `tests/framework/vm_config.json`.
-After the machine is booted, you can still use the socket to send API requests
-for post-boot operations.
+`path_to_the_configuration_file` should represent the path to a file that
+contains a JSON which stores the entire configuration for all of the microVM's
+resources. The JSON **must** contain the configuration for the guest kernel and
+rootfs, as these are mandatory, but all of the other resources are optional,
+so it's your choice if you want to configure them or not. Because using this
+configuration method will also start the microVM, you need to specify all
+desired pre-boot configurable resources in that JSON. The names of the
+resources are the ones from the `firecracker.yaml` file and the names of
+their fields are the same that are used in API requests. You can find an
+example of configuration file at `tests/framework/vm_config.json`.
+After the machine is booted, you can still use the socket to send
+API requests for post-boot operations.
 
 ## Building From Source
 
@@ -297,10 +280,12 @@ git checkout tags/v0.10.1
 
 Within the Firecracker repository root directory:
 
-1. with the default musl target: ```tools/devtool build```
-2. using the gnu target: ```tools/devtool build -l gnu```
+1. with the __default__ musl target: ```tools/devtool build```
+1. (__Experimental only__) using the gnu target: 
+```tools/devtool build -l gnu```
 
 This will build and place the two Firecracker binaries at:
+
 - `build/cargo_target/${toolchain}/debug/firecracker` and
 - `build/cargo_target/${toolchain}/debug/jailer`.
 
@@ -336,8 +321,9 @@ arch=`uname -m`
 cargo build --target ${arch}-unknown-linux-gnu
 ```
 
-That being said, Firecracker binaries built without `devtool` are always
-considered experimental and should not be used in production.
+That being said, Firecracker binaries linked with glibc or built without
+`devtool` are always considered experimental and should not be used in
+production.
 
 ## Running the Integration Test Suite
 

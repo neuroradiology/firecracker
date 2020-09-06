@@ -9,9 +9,12 @@ mod csm;
 mod device;
 mod event_handler;
 mod packet;
+pub mod persist;
 mod unix;
 
 use std::os::unix::io::AsRawFd;
+
+use crate::virtio::persist::Error as VirtioStateError;
 
 pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
 pub use self::device::Vsock;
@@ -23,11 +26,17 @@ use vm_memory::GuestMemoryError;
 use packet::VsockPacket;
 
 mod defs {
+    /// Device ID used in MMIO device identification.
+    /// Because Vsock is unique per-vm, this ID can be hardcoded.
+    pub const VSOCK_DEV_ID: &str = "vsock";
+
     /// Number of virtio queues.
     pub const NUM_QUEUES: usize = 3;
+    /// Max size of virtio queues.
+    pub const QUEUE_SIZE: u16 = 256;
     /// Virtio queue sizes, in number of descriptor chain heads.
     /// There are 3 queues for a virtio device (in this order): RX, TX, Event
-    pub const QUEUE_SIZES: &[u16] = &[256; NUM_QUEUES];
+    pub const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE; NUM_QUEUES];
 
     /// Max vsock packet data/buffer size.
     pub const MAX_PKT_BUF_SIZE: usize = 64 * 1024;
@@ -89,6 +98,8 @@ pub enum VsockError {
     BufDescTooSmall,
     /// The vsock data/buffer virtio descriptor is expected, but missing.
     BufDescMissing,
+    /// EventFd error
+    EventFd(std::io::Error),
     /// Chained GuestMemoryMmap error.
     GuestMemoryMmap(GuestMemoryError),
     /// Bounds check failed on guest memory pointer.
@@ -105,8 +116,9 @@ pub enum VsockError {
     UnreadableDescriptor,
     /// Encountered an unexpected read-only virtio descriptor.
     UnwritableDescriptor,
-    /// EventFd error
-    EventFd(std::io::Error),
+    /// Invalid virtio configuration.
+    VirtioState(VirtioStateError),
+    VsockUdsBackend(VsockUnixBackendError),
 }
 
 type Result<T> = std::result::Result<T, VsockError>;
@@ -150,7 +162,7 @@ pub trait VsockChannel {
 pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::device::{Vsock, RXQ_INDEX, TXQ_INDEX};
     use super::packet::VSOCK_PKT_HDR_SIZE;
     use super::*;
@@ -159,7 +171,7 @@ mod tests {
     use utils::eventfd::EventFd;
 
     use crate::virtio::queue::tests::VirtQueue as GuestQ;
-    use crate::virtio::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+    use crate::virtio::{VirtioDevice, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use utils::epoll::EpollEvent;
     use vm_memory::{GuestAddress, GuestMemoryMmap};
 
@@ -258,9 +270,9 @@ mod tests {
             let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), MEM_SIZE)]).unwrap();
             Self {
                 cid: CID,
-                mem: mem.clone(),
+                mem,
                 mem_size: MEM_SIZE,
-                device: Vsock::new(CID, mem, TestBackend::new()).unwrap(),
+                device: Vsock::new(CID, TestBackend::new()).unwrap(),
             }
         }
 
@@ -292,17 +304,12 @@ mod tests {
             guest_txvq.avail.ring[0].set(0);
             guest_txvq.avail.idx.set(1);
 
+            let queues = vec![rxvq, txvq, evvq];
             EventHandlerContext {
                 guest_rxvq,
                 guest_txvq,
                 guest_evvq,
-                device: Vsock::with_queues(
-                    self.cid,
-                    self.mem.clone(),
-                    TestBackend::new(),
-                    vec![rxvq, txvq, evvq],
-                )
-                .unwrap(),
+                device: Vsock::with_queues(self.cid, TestBackend::new(), queues).unwrap(),
             }
         }
     }
@@ -315,6 +322,11 @@ mod tests {
     }
 
     impl<'a> EventHandlerContext<'a> {
+        pub fn mock_activate(&mut self, mem: GuestMemoryMmap) {
+            // Artificially activate the device.
+            self.device.activate(mem).unwrap();
+        }
+
         pub fn signal_txq_event(&mut self) {
             self.device.queue_events[TXQ_INDEX].write(1).unwrap();
             self.device

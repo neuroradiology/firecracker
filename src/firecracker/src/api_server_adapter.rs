@@ -1,23 +1,29 @@
 // Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
+use std::{
+    os::unix::io::AsRawFd,
+    path::PathBuf,
+    sync::mpsc::{channel, Receiver, Sender, TryRecvError},
+    sync::{Arc, Mutex, RwLock},
+    thread,
+};
 
 use api_server::{ApiRequest, ApiResponse, ApiServer};
+use logger::{error, warn};
 use mmds::MMDS;
 use polly::event_manager::{EventManager, Subscriber};
 use seccomp::BpfProgram;
-use utils::epoll::{EpollEvent, EventSet};
-use utils::eventfd::EventFd;
-use vmm::controller::VmmController;
-use vmm::rpc_interface::{PrebootApiController, RuntimeApiController};
-use vmm::vmm_config::instance_info::InstanceInfo;
-
-use super::FIRECRACKER_VERSION;
+use utils::{
+    epoll::{EpollEvent, EventSet},
+    eventfd::EventFd,
+};
+use vmm::{
+    rpc_interface::{PrebootApiController, RuntimeApiController},
+    vmm_config::instance_info::InstanceInfo,
+    vmm_config::machine_config::VmConfig,
+    Vmm,
+};
 
 struct ApiServerAdapter {
     api_event_fd: EventFd,
@@ -33,17 +39,18 @@ impl ApiServerAdapter {
         api_event_fd: EventFd,
         from_api: Receiver<ApiRequest>,
         to_api: Sender<ApiResponse>,
-        vmm_controller: VmmController,
+        vm_config: VmConfig,
+        vmm: Arc<Mutex<Vmm>>,
         event_manager: &mut EventManager,
     ) {
         let api_adapter = Arc::new(Mutex::new(Self {
             api_event_fd,
             from_api,
             to_api,
-            controller: RuntimeApiController(vmm_controller),
+            controller: RuntimeApiController::new(vm_config, vmm),
         }));
         event_manager
-            .add_subscriber(api_adapter.clone())
+            .add_subscriber(api_adapter)
             .expect("Cannot register the api event to the event manager.");
         loop {
             event_manager
@@ -96,6 +103,7 @@ pub fn run_with_api(
     instance_info: InstanceInfo,
     start_time_us: Option<u64>,
     start_time_cpu_us: Option<u64>,
+    boot_timer_enabled: bool,
 ) {
     // FD to notify of API events. This is a blocking eventfd by design.
     // It is used in the config/pre-boot loop which is a simple blocking loop
@@ -107,9 +115,11 @@ pub fn run_with_api(
 
     // MMDS only supported with API.
     let mmds_info = MMDS.clone();
-    let api_shared_info = Arc::new(RwLock::new(instance_info));
+    let api_shared_info = Arc::new(RwLock::new(instance_info.clone()));
     let vmm_shared_info = api_shared_info.clone();
-    let to_vmm_event_fd = api_event_fd.try_clone().unwrap();
+    let to_vmm_event_fd = api_event_fd
+        .try_clone()
+        .expect("Failed to clone API event FD");
 
     let api_seccomp_filter = seccomp_filter.clone();
     // Start the separate API thread.
@@ -158,11 +168,17 @@ pub fn run_with_api(
 
     // Configure, build and start the microVM.
     let (vm_resources, vmm) = match config_json {
-        Some(json) => super::build_microvm_from_json(seccomp_filter, &mut event_manager, json),
+        Some(json) => super::build_microvm_from_json(
+            seccomp_filter,
+            &mut event_manager,
+            json,
+            &instance_info,
+            boot_timer_enabled,
+        ),
         None => PrebootApiController::build_microvm_from_requests(
             seccomp_filter,
             &mut event_manager,
-            FIRECRACKER_VERSION.to_string(),
+            instance_info,
             || {
                 let req = from_api
                     .recv()
@@ -179,13 +195,14 @@ pub fn run_with_api(
                     .send(Box::new(response))
                     .expect("one-shot channel closed")
             },
+            boot_timer_enabled,
         ),
     };
 
     // Start the metrics.
     firecracker_metrics
         .lock()
-        .expect("Metrics lock poisoned.")
+        .expect("Poisoned lock")
         .start(super::metrics::WRITE_METRICS_PERIOD_MS);
 
     // Update the api shared instance info.
@@ -195,7 +212,8 @@ pub fn run_with_api(
         api_event_fd,
         from_api,
         to_api,
-        VmmController::new(vm_resources, vmm),
+        vm_resources.vm_config().clone(),
+        vmm,
         &mut event_manager,
     );
 }

@@ -199,19 +199,15 @@ class Logger():
 
     @staticmethod
     def create_json(
-            log_fifo=None,
-            metrics_fifo=None,
+            log_path=None,
             level=None,
             show_level=None,
             show_log_origin=None):
         """Compose the json associated to this type of API request."""
         datax = {}
 
-        if log_fifo is not None:
-            datax['log_fifo'] = log_fifo
-
-        if metrics_fifo is not None:
-            datax['metrics_fifo'] = metrics_fifo
+        if log_path is not None:
+            datax['log_path'] = log_path
 
         if level is not None:
             datax['level'] = level
@@ -222,6 +218,76 @@ class Logger():
         if show_log_origin is not None:
             datax['show_log_origin'] = show_log_origin
 
+        return datax
+
+
+class SnapshotCreate():
+    """Facility for sending create snapshot commands on the microvm."""
+
+    SNAPSHOT_CREATE_URL = 'snapshot/create'
+
+    def __init__(self, api_usocket_full_name, api_session):
+        """Specify the information needed for sending API requests."""
+        url_encoded_path = urllib.parse.quote_plus(api_usocket_full_name)
+        api_url = API_USOCKET_URL_PREFIX + url_encoded_path + '/'
+        self._snapshot_cfg_url = api_url + self.SNAPSHOT_CREATE_URL
+        self._api_session = api_session
+
+    def put(self, **args):
+        """Create a snapshot of the microvm."""
+        datax = self.create_json(**args)
+        return self._api_session.put(
+            "{}".format(self._snapshot_cfg_url),
+            json=datax
+        )
+
+    @staticmethod
+    def create_json(mem_file_path, snapshot_path, diff=False, version=None):
+        """Compose the json associated to this type of API request."""
+        if diff:
+            snapshot_type = 'Diff'
+        else:
+            snapshot_type = 'Full'
+        datax = {
+            'mem_file_path': mem_file_path,
+            'snapshot_path': snapshot_path,
+            'snapshot_type': snapshot_type,
+        }
+        if version is not None:
+            datax['version'] = version
+
+        return datax
+
+
+class SnapshotLoad():
+    """Facility for sending load snapshot commands on the microvm."""
+
+    SNAPSHOT_LOAD_URL = 'snapshot/load'
+
+    def __init__(self, api_usocket_full_name, api_session):
+        """Specify the information needed for sending API requests."""
+        url_encoded_path = urllib.parse.quote_plus(api_usocket_full_name)
+        api_url = API_USOCKET_URL_PREFIX + url_encoded_path + '/'
+        self._snapshot_cfg_url = api_url + self.SNAPSHOT_LOAD_URL
+        self._api_session = api_session
+
+    def put(self, **args):
+        """Load a snapshot of the microvm."""
+        datax = self.create_json(**args)
+        return self._api_session.put(
+            "{}".format(self._snapshot_cfg_url),
+            json=datax
+        )
+
+    @staticmethod
+    def create_json(mem_file_path, snapshot_path, diff=False):
+        """Compose the json associated to this type of API request."""
+        datax = {
+            'mem_file_path': mem_file_path,
+            'snapshot_path': snapshot_path,
+        }
+        if diff:
+            datax['enable_diff_snapshots'] = True
         return datax
 
 
@@ -256,12 +322,12 @@ class Metrics:
 
     @staticmethod
     def create_json(
-            metrics_fifo=None,
+            metrics_path=None,
     ):
         """Compose the json associated to this type of API request."""
         datax = {}
-        if metrics_fifo is not None:
-            datax['metrics_fifo'] = metrics_fifo
+        if metrics_path is not None:
+            datax['metrics_path'] = metrics_path
         return datax
 
 
@@ -307,7 +373,8 @@ class MachineConfigure():
             vcpu_count=None,
             mem_size_mib=None,
             ht_enabled=None,
-            cpu_template=None):
+            cpu_template=None,
+            track_dirty_pages=None):
         """Compose the json associated to this type of API request."""
         datax = {}
         if vcpu_count is not None:
@@ -321,6 +388,9 @@ class MachineConfigure():
 
         if cpu_template is not None:
             datax['cpu_template'] = cpu_template
+
+        if track_dirty_pages is not None:
+            datax['track_dirty_pages'] = track_dirty_pages
 
         return datax
 
@@ -342,6 +412,13 @@ class MMDS():
         """Send a new MMDS request."""
         return self._api_session.put(
             "{}".format(self._mmds_cfg_url),
+            json=args['json']
+        )
+
+    def put_config(self, **args):
+        """Send a new MMDS config request."""
+        return self._api_session.put(
+            "{}".format(self._mmds_cfg_url + "/config"),
             json=args['json']
         )
 
@@ -417,6 +494,38 @@ class Network():
 
         if rx_rate_limiter is not None:
             datax['rx_rate_limiter'] = rx_rate_limiter
+
+        return datax
+
+
+class Vm():
+    """Facility for handling the state for a microvm."""
+
+    VM_CFG_RESOURCE = 'vm'
+
+    def __init__(self, api_usocket_full_name, api_session):
+        """Specify the information needed for sending API requests."""
+        url_encoded_path = urllib.parse.quote_plus(api_usocket_full_name)
+        api_url = API_USOCKET_URL_PREFIX + url_encoded_path + '/'
+
+        self._vm_cfg_url = api_url + self.VM_CFG_RESOURCE
+        self._api_session = api_session
+
+    def patch(self, **args):
+        """Apply an update to the microvm state."""
+        datax = self.create_json(**args)
+
+        return self._api_session.patch(
+            self._vm_cfg_url,
+            json=datax
+        )
+
+    @staticmethod
+    def create_json(state):
+        """Create the json for the vm specific API request."""
+        datax = {
+            'state': state
+        }
 
         return datax
 

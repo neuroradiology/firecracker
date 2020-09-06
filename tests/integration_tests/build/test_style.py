@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests ensuring codebase style compliance for Rust and Python."""
 
-from subprocess import run, PIPE
-
 import os
 import platform
 
@@ -13,29 +11,29 @@ import yaml
 import framework.utils as utils
 
 SUCCESS_CODE = 0
+MACHINE = platform.machine()
+TARGETS = ["{}-unknown-linux-gnu".format(MACHINE),
+           "{}-unknown-linux-musl".format(MACHINE)]
 
 
 @pytest.mark.timeout(120)
 @pytest.mark.skipif(
-    platform.machine() != "x86_64",
-    reason="rustfmt is not available on Rust 1.38 on aarch64"
+    MACHINE != "x86_64",
+    reason="no need to test it on multiple platforms"
 )
 def test_rust_style():
     """Fail if there's misbehaving Rust style in this repo."""
     # Check that the output is empty.
-    process = run(
-        'cargo fmt --all -- --check',
-        shell=True,
-        check=True,
-        stdout=PIPE
-    )
+    _, stdout, _ = utils.run_cmd(
+        'cargo fmt --all -- --check')
+
     # rustfmt prepends `"Diff in"` to the reported output.
-    assert "Diff in" not in process.stdout.decode('utf-8')
+    assert "Diff in" not in stdout
 
 
 @pytest.mark.timeout(120)
 @pytest.mark.skipif(
-    platform.machine() != "x86_64",
+    MACHINE != "x86_64",
     reason="no need to test it on multiple platforms"
 )
 def test_python_style():
@@ -45,9 +43,9 @@ def test_python_style():
         # Pylint
         'python3 -m pylint --jobs=0 --persistent=no --score=no ' \
         '--output-format=colorized --attr-rgx="[a-z_][a-z0-9_]{1,30}$" ' \
-        '--argument-rgx="[a-z_][a-z0-9_]{1,30}$" ' \
+        '--argument-rgx="[a-z_][a-z0-9_]{1,35}$" ' \
         '--variable-rgx="[a-z_][a-z0-9_]{1,30}$" --disable=' \
-        'bad-continuation,fixme,too-many-instance-attributes,' \
+        'bad-continuation,fixme,too-many-instance-attributes,import-error,' \
         'too-many-locals,too-many-arguments',
 
         # pycodestyle
@@ -71,18 +69,15 @@ def test_python_style():
     ])
 
 
-@pytest.mark.skipif(
-    platform.machine() != "x86_64",
-    reason="no need to test it on multiple platforms"
+@pytest.mark.parametrize(
+    "target",
+    TARGETS
 )
-def test_rust_clippy():
+def test_rust_clippy(target):
     """Fails if clippy generates any error, warnings are ignored."""
-    run(
-        'cargo clippy --all --profile test -- -D warnings',
-        shell=True,
-        check=True,
-        stdout=PIPE
-    )
+    utils.run_cmd(
+        'cargo clippy --target {} --all --profile test'
+        ' -- -D warnings'.format(target))
 
 
 def check_swagger_style(yaml_spec):
@@ -96,7 +91,7 @@ def check_swagger_style(yaml_spec):
 
 
 @pytest.mark.skipif(
-    platform.machine() != "x86_64",
+    MACHINE != "x86_64",
     reason="no need to test it on multiple platforms"
 )
 def test_firecracker_swagger():

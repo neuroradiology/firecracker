@@ -3,9 +3,10 @@
 
 use std::io::{Error as WriteError, Write};
 
-use ascii::{COLON, CR, LF, SP};
-use common::{Body, Version};
-use headers::{Header, MediaType};
+use crate::ascii::{COLON, CR, LF, SP};
+use crate::common::{Body, Version};
+use crate::headers::{Header, MediaType};
+use crate::Method;
 
 /// Wrapper over a response status code.
 ///
@@ -24,6 +25,8 @@ pub enum StatusCode {
     BadRequest,
     /// 404, Not Found
     NotFound,
+    /// 405, Method Not Allowed
+    MethodNotAllowed,
     /// 500, Internal Server Error
     InternalServerError,
     /// 501, Not Implemented
@@ -39,12 +42,14 @@ impl StatusCode {
             Self::NoContent => b"204",
             Self::BadRequest => b"400",
             Self::NotFound => b"404",
+            Self::MethodNotAllowed => b"405",
             Self::InternalServerError => b"500",
             Self::NotImplemented => b"501",
         }
     }
 }
 
+#[derive(Debug, PartialEq)]
 struct StatusLine {
     http_version: Version,
     status_code: StatusCode,
@@ -71,10 +76,12 @@ impl StatusLine {
 /// Wrapper over the list of headers associated with a HTTP Response.
 /// When creating a ResponseHeaders object, the content type is initialized to `text/plain`.
 /// The content type can be updated with a call to `set_content_type`.
+#[derive(Debug, PartialEq)]
 pub struct ResponseHeaders {
     content_length: i32,
     content_type: MediaType,
     server: String,
+    allow: Vec<Method>,
 }
 
 impl Default for ResponseHeaders {
@@ -83,11 +90,32 @@ impl Default for ResponseHeaders {
             content_length: Default::default(),
             content_type: Default::default(),
             server: String::from("Firecracker API"),
+            allow: Vec::new(),
         }
     }
 }
 
 impl ResponseHeaders {
+    // The logic pertaining to `Allow` header writing.
+    fn write_allow_header<T: Write>(&self, buf: &mut T) -> Result<(), WriteError> {
+        if self.allow.is_empty() {
+            return Ok(());
+        }
+
+        buf.write_all(b"Allow: ")?;
+
+        let delimitator = b", ";
+        for (idx, method) in self.allow.iter().enumerate() {
+            buf.write_all(method.raw())?;
+            // We check above that `self.allow` is not empty.
+            if idx < self.allow.len() - 1 {
+                buf.write_all(delimitator)?;
+            }
+        }
+
+        buf.write_all(&[CR, LF])
+    }
+
     /// Writes the headers to `buf` using the HTTP specification.
     pub fn write_all<T: Write>(&self, buf: &mut T) -> Result<(), WriteError> {
         buf.write_all(Header::Server.raw())?;
@@ -97,6 +125,8 @@ impl ResponseHeaders {
         buf.write_all(&[CR, LF])?;
         buf.write_all(b"Connection: keep-alive")?;
         buf.write_all(&[CR, LF])?;
+
+        self.write_allow_header(buf)?;
 
         if self.content_length != 0 {
             buf.write_all(Header::ContentType.raw())?;
@@ -136,6 +166,7 @@ impl ResponseHeaders {
 /// the body is initialized to `None` and the header is initialized with the `default` value. The body
 /// can be updated with a call to `set_body`. The header can be updated with `set_content_type` and
 /// `set_server`.
+#[derive(Debug, PartialEq)]
 pub struct Response {
     status_line: StatusLine,
     headers: ResponseHeaders,
@@ -169,6 +200,16 @@ impl Response {
     /// Sets the HTTP response server.
     pub fn set_server(&mut self, server: &str) {
         self.headers.set_server(server);
+    }
+
+    /// Sets the HTTP allowed methods.
+    pub fn set_allow(&mut self, methods: Vec<Method>) {
+        self.headers.allow = methods;
+    }
+
+    /// Allows a specific HTTP method.
+    pub fn allow_method(&mut self, method: Method) {
+        self.headers.allow.push(method);
     }
 
     fn write_body<T: Write>(&self, mut buf: T) -> Result<(), WriteError> {
@@ -215,6 +256,11 @@ impl Response {
     pub fn http_version(&self) -> Version {
         self.status_line.http_version
     }
+
+    /// Returns the allowed HTTP methods.
+    pub fn allow(&self) -> Vec<Method> {
+        self.headers.allow.clone()
+    }
 }
 
 #[cfg(test)]
@@ -244,6 +290,20 @@ mod tests {
         let mut response_buf: [u8; 126] = [0; 126];
         assert!(response.write_all(&mut response_buf.as_mut()).is_ok());
         assert!(response_buf.as_ref() == expected_response);
+
+        // Test response `Allow` header.
+        let mut response = Response::new(Version::Http10, StatusCode::OK);
+        let allowed_methods = vec![Method::Get, Method::Patch, Method::Put];
+        response.set_allow(allowed_methods.clone());
+        assert_eq!(response.allow(), allowed_methods);
+
+        let expected_response: &'static [u8] = b"HTTP/1.0 200 \r\n\
+            Server: Firecracker API\r\n\
+            Connection: keep-alive\r\n\
+            Allow: GET, PATCH, PUT\r\n\r\n";
+        let mut response_buf: [u8; 90] = [0; 90];
+        assert!(response.write_all(&mut response_buf.as_mut()).is_ok());
+        assert_eq!(response_buf.as_ref(), expected_response);
 
         // Test write failed.
         let mut response_buf: [u8; 1] = [0; 1];
@@ -287,7 +347,16 @@ mod tests {
         assert_eq!(StatusCode::NoContent.raw(), b"204");
         assert_eq!(StatusCode::BadRequest.raw(), b"400");
         assert_eq!(StatusCode::NotFound.raw(), b"404");
+        assert_eq!(StatusCode::MethodNotAllowed.raw(), b"405");
         assert_eq!(StatusCode::InternalServerError.raw(), b"500");
         assert_eq!(StatusCode::NotImplemented.raw(), b"501");
+    }
+
+    #[test]
+    fn test_allow_method() {
+        let mut response = Response::new(Version::Http10, StatusCode::MethodNotAllowed);
+        response.allow_method(Method::Get);
+        response.allow_method(Method::Put);
+        assert_eq!(response.allow(), vec![Method::Get, Method::Put]);
     }
 }

@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests scenarios for shutting down Firecracker/VM."""
 import os
-from subprocess import run, PIPE
 import time
+
+import framework.utils as utils
 
 import host_tools.logging as log_tools
 import host_tools.network as net_tools  # pylint: disable=import-error
@@ -16,7 +17,7 @@ def test_reboot(test_microvm_with_ssh, network_config):
 
     # We don't need to monitor the memory for this test because we are
     # just rebooting and the process dies before pmap gets the RSS.
-    test_microvm.memory_events_queue = None
+    test_microvm.memory_monitor = None
 
     # Set up the microVM with 4 vCPUs, 256 MiB of RAM, 0 network ifaces, and
     # a root file system with the rw permission. The network interfaces is
@@ -28,7 +29,7 @@ def test_reboot(test_microvm_with_ssh, network_config):
     metrics_fifo_path = os.path.join(test_microvm.path, 'metrics_fifo')
     metrics_fifo = log_tools.Fifo(metrics_fifo_path)
     response = test_microvm.metrics.put(
-        metrics_fifo=test_microvm.create_jailed_resource(metrics_fifo.path)
+        metrics_path=test_microvm.create_jailed_resource(metrics_fifo.path)
     )
     assert test_microvm.api_session.is_status_no_content(response.status_code)
 
@@ -41,8 +42,8 @@ def test_reboot(test_microvm_with_ssh, network_config):
     cmd = 'ps -o nlwp {} | tail -1 | awk \'{{print $1}}\''.format(
         firecracker_pid
     )
-    process = run(cmd, stdout=PIPE, stderr=PIPE, shell=True, check=True)
-    nr_of_threads = process.stdout.decode('utf-8').rstrip()
+    _, stdout, _ = utils.run_cmd(cmd)
+    nr_of_threads = stdout.rstrip()
     assert int(nr_of_threads) == 6
 
     # Consume existing metrics

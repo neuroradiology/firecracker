@@ -5,10 +5,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use logger::{error, warn, Metric, METRICS};
-use std::fmt;
 use std::num::Wrapping;
-use std::{io, result};
+use std::{fmt, io, result};
+
+use logger::{error, warn, IncMetric, METRICS};
 use utils::eventfd::EventFd;
 
 use crate::bus::BusDevice;
@@ -23,19 +23,15 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Error::CloneCpuResetEvt(io_err) => write!(
-                f,
-                "Could not clone CPU reset eventfd: {}.",
-                io_err.to_string()
-            ),
+            Error::CloneCpuResetEvt(io_err) => {
+                write!(f, "Could not clone CPU reset eventfd: {io_err}.",)
+            }
             Error::KbdInterruptDisabled => {
                 write!(f, "Keyboard interrupt disabled by guest driver.",)
             }
-            Error::KbdInterruptFailure(io_err) => write!(
-                f,
-                "Could not trigger keyboard interrupt: {}.",
-                io_err.to_string()
-            ),
+            Error::KbdInterruptFailure(io_err) => {
+                write!(f, "Could not trigger keyboard interrupt: {io_err}.",)
+            }
             Error::InternalBufferFull => write!(f, "i8042 internal buffer full."),
         }
     }
@@ -143,7 +139,7 @@ impl I8042Device {
 
         match self.trigger_kbd_interrupt() {
             Ok(_) | Err(Error::KbdInterruptDisabled) => Ok(()),
-            Err(e) => Err(e),
+            Err(err) => Err(err),
         }
     }
 
@@ -246,8 +242,8 @@ impl BusDevice for I8042Device {
                 // The guest wants to assert the CPU reset line. We handle that by triggering
                 // our exit event fd. Meaning Firecracker will be exiting as soon as the VMM
                 // thread wakes up to handle this event.
-                if let Err(e) = self.reset_evt.write(1) {
-                    error!("Failed to trigger i8042 reset event: {:?}", e);
+                if let Err(err) = self.reset_evt.write(1) {
+                    error!("Failed to trigger i8042 reset event: {:?}", err);
                     METRICS.i8042.error_count.inc();
                 }
                 METRICS.i8042.reset_count.inc();

@@ -7,8 +7,10 @@ of the cartesian product of all artifact sets.
 """
 
 import os
-
-ARTIFACTS_LOCAL_ROOT = "/tmp/ci-artifacts/"
+import sys
+import traceback
+from framework.artifacts import ARTIFACTS_LOCAL_ROOT
+from framework.utils import ExceptionAggregator
 
 
 class TestContext:
@@ -25,54 +27,64 @@ class TestContext:
         self._context[key] = value
 
     @property
+    def firecracker(self):
+        """Return the firecracker binary artifact."""
+        return self._context.get("firecracker", None)
+
+    @firecracker.setter
+    def firecracker(self, firecracker):
+        """Setter for firecracker binary artifact."""
+        self._context["firecracker"] = firecracker
+
+    @property
     def kernel(self):
         """Return the kernel artifact."""
-        return self._context.get('kernel', None)
+        return self._context.get("kernel", None)
 
     @kernel.setter
     def kernel(self, kernel):
         """Setter for kernel artifact."""
-        self._context['kernel'] = kernel
+        self._context["kernel"] = kernel
 
     @property
     def disk(self):
         """Return the disk artifact."""
-        return self._context.get('disk', None)
+        return self._context.get("disk", None)
 
     @disk.setter
     def disk(self, disk):
         """Setter for disk artifact."""
-        self._context['disk'] = disk
+        self._context["disk"] = disk
 
     @property
     def microvm(self):
         """Return the microvm artifact."""
-        return self._context.get('microvm', None)
+        return self._context.get("microvm", None)
 
     @microvm.setter
     def microvm(self, microvm):
         """Setter for kernel artifact."""
-        self._context['microvm'] = microvm
+        self._context["microvm"] = microvm
 
     @property
     def snapshot(self):
         """Return the snapshot artifact."""
-        return self._context.get('snapshot', None)
+        return self._context.get("snapshot", None)
 
     @snapshot.setter
     def snapshot(self, snapshot):
         """Setter for snapshot artifact."""
-        self._context['snapshot'] = snapshot
+        self._context["snapshot"] = snapshot
 
     @property
     def custom(self):
         """Return the custom context."""
-        return self._context.get('custom', None)
+        return self._context.get("custom", None)
 
     @custom.setter
     def custom(self, custom):
         """Setter for custom context."""
-        self._context['custom'] = custom
+        self._context["custom"] = custom
 
 
 class TestMatrix:
@@ -80,10 +92,9 @@ class TestMatrix:
 
     __test__ = False
 
-    def __init__(self,
-                 artifact_sets,
-                 context=TestContext(),
-                 cache_dir=ARTIFACTS_LOCAL_ROOT):
+    def __init__(
+        self, artifact_sets, context=TestContext(), cache_dir=ARTIFACTS_LOCAL_ROOT
+    ):
         """Initialize context, cache dir, and artifact_sets."""
         self._context = context
         # Stores the artifact sets array.
@@ -93,6 +104,7 @@ class TestMatrix:
         if not os.path.exists(cache_dir):
             os.mkdir(cache_dir)
         self._cache_dir = cache_dir
+        self._failure_aggregator = ExceptionAggregator(add_newline=True)
 
     @property
     def sets(self):
@@ -112,7 +124,12 @@ class TestMatrix:
         # Validate solution: tuple element count is equal to
         # set stack size.
         if len(self._sets) == len(cartesian_product):
-            self._run_test_fn(cartesian_product, test_fn)
+            try:
+                self._run_test_fn(cartesian_product, test_fn)
+            except Exception as _err:  # pylint: disable=W0703
+                self._failure_aggregator.add_row(
+                    "".join(traceback.format_exception(*sys.exc_info()))
+                )
             return
 
         current_set = self._sets[self._set_index]
@@ -149,3 +166,6 @@ class TestMatrix:
         # Recursive backtracking will generate the cartesian product of
         # the artifact sets.
         self._backtrack(test_fn, [])
+
+        if self._failure_aggregator.has_any():
+            raise self._failure_aggregator

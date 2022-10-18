@@ -3,13 +3,15 @@
 
 //! Defines the structures needed for saving/restoring a RateLimiter.
 
-use super::*;
 use snapshot::Persist;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 
+use super::*;
+
 /// State for saving a TokenBucket.
-#[derive(Versionize)]
+#[derive(Clone, Versionize)]
+// NOTICE: Any changes to this structure require a snapshot version bump.
 pub struct TokenBucketState {
     size: u64,
     one_time_burst: u64,
@@ -51,7 +53,8 @@ impl Persist<'_> for TokenBucket {
 }
 
 /// State for saving a RateLimiter.
-#[derive(Versionize)]
+#[derive(Clone, Versionize)]
+// NOTICE: Any changes to this structure require a snapshot version bump.
 pub struct RateLimiterState {
     ops: Option<TokenBucketState>,
     bandwidth: Option<TokenBucketState>,
@@ -107,7 +110,7 @@ mod tests {
         assert!(tb.partial_eq(&restored_tb));
 
         // Check that TokenBucket restores correctly after replenishing tokens.
-        tb.replenish(100);
+        tb.force_replenish(100);
         let restored_tb = TokenBucket::restore((), &tb.save()).unwrap();
         assert!(tb.partial_eq(&restored_tb));
 
@@ -138,11 +141,11 @@ mod tests {
         assert!(rate_limiter
             .ops()
             .unwrap()
-            .partial_eq(&restored_rate_limiter.ops().unwrap()));
+            .partial_eq(restored_rate_limiter.ops().unwrap()));
         assert!(rate_limiter
             .bandwidth()
             .unwrap()
-            .partial_eq(&restored_rate_limiter.bandwidth().unwrap()));
+            .partial_eq(restored_rate_limiter.bandwidth().unwrap()));
         assert_eq!(
             restored_rate_limiter.timer_fd.get_state(),
             TimerState::Disarmed
@@ -157,11 +160,11 @@ mod tests {
         assert!(rate_limiter
             .ops()
             .unwrap()
-            .partial_eq(&restored_rate_limiter.ops().unwrap()));
+            .partial_eq(restored_rate_limiter.ops().unwrap()));
         assert!(rate_limiter
             .bandwidth()
             .unwrap()
-            .partial_eq(&restored_rate_limiter.bandwidth().unwrap()));
+            .partial_eq(restored_rate_limiter.bandwidth().unwrap()));
         assert_eq!(
             restored_rate_limiter.timer_fd.get_state(),
             TimerState::Disarmed
@@ -175,11 +178,11 @@ mod tests {
         assert!(rate_limiter
             .ops()
             .unwrap()
-            .partial_eq(&restored_rate_limiter.ops().unwrap()));
+            .partial_eq(restored_rate_limiter.ops().unwrap()));
         assert!(rate_limiter
             .bandwidth()
             .unwrap()
-            .partial_eq(&restored_rate_limiter.bandwidth().unwrap()));
+            .partial_eq(restored_rate_limiter.bandwidth().unwrap()));
 
         // Test serialization.
         let mut mem = vec![0; 4096];
@@ -197,10 +200,10 @@ mod tests {
         assert!(rate_limiter
             .ops()
             .unwrap()
-            .partial_eq(&restored_rate_limiter.ops().unwrap()));
+            .partial_eq(restored_rate_limiter.ops().unwrap()));
         assert!(rate_limiter
             .bandwidth()
             .unwrap()
-            .partial_eq(&restored_rate_limiter.bandwidth().unwrap()));
+            .partial_eq(restored_rate_limiter.bandwidth().unwrap()));
     }
 }

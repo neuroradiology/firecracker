@@ -12,15 +12,24 @@ pub const RX_INDEX: usize = 0;
 // The index of the tx queue from Net device queues/queues_evts vector.
 pub const TX_INDEX: usize = 1;
 
-#[macro_use]
 pub mod device;
 pub mod event_handler;
 pub mod persist;
 mod tap;
+pub mod test_utils;
+
+pub use tap::Error as TapError;
 
 pub use self::device::Net;
 pub use self::event_handler::*;
-pub use tap::Error as TapError;
+
+/// Enum representing the Net device queue types
+pub enum NetQueue {
+    /// The RX queue
+    Rx,
+    /// The TX queue
+    Tx,
+}
 
 #[derive(Debug)]
 pub enum Error {

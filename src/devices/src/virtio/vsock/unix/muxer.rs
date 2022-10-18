@@ -35,8 +35,9 @@ use std::io::Read;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 
-use logger::{debug, error, info, warn, Metric, METRICS};
+use logger::{debug, error, info, warn, IncMetric, METRICS};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use vm_memory::GuestMemoryMmap;
 
 use super::super::csm::ConnState;
 use super::super::defs::uapi;
@@ -44,11 +45,9 @@ use super::super::packet::VsockPacket;
 use super::super::{
     Result as VsockResult, VsockBackend, VsockChannel, VsockEpollListener, VsockError,
 };
-use super::defs;
 use super::muxer_killq::MuxerKillQ;
 use super::muxer_rxq::MuxerRxQ;
-use super::MuxerConnection;
-use super::{Error, Result};
+use super::{defs, Error, MuxerConnection, Result};
 
 /// A unique identifier of a `MuxerConnection` object. Connections are stored in a hash map,
 /// keyed by a `ConnMapKey` object.
@@ -90,10 +89,8 @@ pub struct VsockMuxer {
     listener_map: HashMap<RawFd, EpollListener>,
     /// The RX queue. Items in this queue are consumed by `VsockMuxer::recv_pkt()`, and
     /// produced
-    /// - by `VsockMuxer::send_pkt()` (e.g. RST in response to a connection request packet);
-    ///   and
-    /// - in response to EPOLLIN events (e.g. data available to be read from an AF_UNIX
-    ///   socket).
+    /// - by `VsockMuxer::send_pkt()` (e.g. RST in response to a connection request packet); and
+    /// - in response to EPOLLIN events (e.g. data available to be read from an AF_UNIX socket).
     rxq: MuxerRxQ,
     /// A queue used for terminating connections that are taking too long to shut down.
     killq: MuxerKillQ,
@@ -116,9 +113,8 @@ impl VsockChannel for VsockMuxer {
     ///
     /// Retuns:
     /// - `Ok(())`: `pkt` has been successfully filled in; or
-    /// - `Err(VsockError::NoData)`: there was no available data with which to fill in the
-    ///   packet.
-    fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> VsockResult<()> {
+    /// - `Err(VsockError::NoData)`: there was no available data with which to fill in the packet.
+    fn recv_pkt(&mut self, pkt: &mut VsockPacket, mem: &GuestMemoryMmap) -> VsockResult<()> {
         // We'll look for instructions on how to build the RX packet in the RX queue. If the
         // queue is empty, that doesn't necessarily mean we don't have any pending RX, since
         // the queue might be out-of-sync. If that's the case, we'll attempt to sync it first,
@@ -154,7 +150,7 @@ impl VsockChannel for VsockMuxer {
                     let mut conn_res = Err(VsockError::NoData);
                     let mut do_pop = true;
                     self.apply_conn_mutation(key, |conn| {
-                        conn_res = conn.recv_pkt(pkt);
+                        conn_res = conn.recv_pkt(pkt, mem);
                         do_pop = !conn.has_pending_rx();
                     });
                     if do_pop {
@@ -191,7 +187,7 @@ impl VsockChannel for VsockMuxer {
     /// Returns:
     /// always `Ok(())` - the packet has been consumed, and its virtio TX buffers can be
     /// returned to the guest vsock driver.
-    fn send_pkt(&mut self, pkt: &VsockPacket) -> VsockResult<()> {
+    fn send_pkt(&mut self, pkt: &VsockPacket, mem: &GuestMemoryMmap) -> VsockResult<()> {
         let conn_key = ConnMapKey {
             local_port: pkt.dst_port(),
             peer_port: pkt.src_port(),
@@ -226,7 +222,7 @@ impl VsockChannel for VsockMuxer {
             // connection requests.
             if pkt.op() == uapi::VSOCK_OP_REQUEST {
                 // Oh, this is a connection request!
-                self.handle_peer_request_pkt(&pkt);
+                self.handle_peer_request_pkt(pkt);
             } else {
                 // Send back an RST, to let the drive know we weren't expecting this packet.
                 self.enq_rst(pkt.dst_port(), pkt.src_port());
@@ -245,7 +241,7 @@ impl VsockChannel for VsockMuxer {
         // Alright, everything looks in order - forward this packet to its owning connection.
         let mut res: VsockResult<()> = Ok(());
         self.apply_conn_mutation(conn_key, |conn| {
-            res = conn.send_pkt(pkt);
+            res = conn.send_pkt(pkt, mem);
         });
 
         res
@@ -272,7 +268,7 @@ impl VsockEpollListener for VsockMuxer {
     /// Get the epoll events to be polled upstream.
     ///
     /// Since the polled FD is a nested epoll FD, we're only interested in EPOLLIN events (i.e.
-    /// some event occured on one of the FDs registered under our epoll FD).
+    /// some event occurred on one of the FDs registered under our epoll FD).
     fn get_polled_evset(&self) -> EventSet {
         EventSet::IN
     }
@@ -282,10 +278,7 @@ impl VsockEpollListener for VsockMuxer {
         debug!("vsock: muxer received kick");
 
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
-        match self
-            .epoll
-            .wait(epoll_events.len(), 0, epoll_events.as_mut_slice())
-        {
+        match self.epoll.wait(0, epoll_events.as_mut_slice()) {
             Ok(ev_cnt) => {
                 for ev in &epoll_events[0..ev_cnt] {
                     self.handle_event(
@@ -297,8 +290,8 @@ impl VsockEpollListener for VsockMuxer {
                     );
                 }
             }
-            Err(e) => {
-                warn!("vsock: failed to consume muxer epoll event: {}", e);
+            Err(err) => {
+                warn!("vsock: failed to consume muxer epoll event: {}", err);
                 METRICS.vsock.muxer_event_fails.inc();
             }
         }
@@ -329,30 +322,33 @@ impl VsockMuxer {
             local_port_set: HashSet::with_capacity(defs::MAX_CONNECTIONS),
         };
 
-        // Listen on the host initiated socket, for incomming connections.
+        // Listen on the host initiated socket, for incoming connections.
         muxer.add_listener(muxer.host_sock.as_raw_fd(), EpollListener::HostSock)?;
         Ok(muxer)
     }
 
+    pub fn host_sock_path(&self) -> &str {
+        &self.host_sock_path
+    }
+
     /// Handle/dispatch an epoll event to its listener.
-    fn handle_event(&mut self, fd: RawFd, evset: EventSet) {
+    fn handle_event(&mut self, fd: RawFd, event_set: EventSet) {
         debug!(
             "vsock: muxer processing event: fd={}, evset={:?}",
-            fd, evset
+            fd, event_set
         );
 
         match self.listener_map.get_mut(&fd) {
             // This event needs to be forwarded to a `MuxerConnection` that is listening for
             // it.
-            Some(EpollListener::Connection { key, evset }) => {
+            Some(EpollListener::Connection { key, evset: _ }) => {
                 let key_copy = *key;
-                let evset_copy = *evset;
                 // The handling of this event will most probably mutate the state of the
-                // receiving conection. We'll need to check for new pending RX, event set
+                // receiving connection. We'll need to check for new pending RX, event set
                 // mutation, and all that, so we're wrapping the event delivery inside those
                 // checks.
                 self.apply_conn_mutation(key_copy, |conn| {
-                    conn.notify(evset_copy);
+                    conn.notify(event_set);
                 });
             }
 
@@ -391,7 +387,7 @@ impl VsockMuxer {
             Some(EpollListener::LocalStream(_)) => {
                 if let Some(EpollListener::LocalStream(mut stream)) = self.remove_listener(fd) {
                     Self::read_local_stream_port(&mut stream)
-                        .and_then(|peer_port| Ok((self.allocate_local_port(), peer_port)))
+                        .map(|peer_port| (self.allocate_local_port(), peer_port))
                         .and_then(|(local_port, peer_port)| {
                             self.add_connection(
                                 ConnMapKey {
@@ -414,7 +410,10 @@ impl VsockMuxer {
             }
 
             _ => {
-                info!("vsock: unexpected event: fd={:?}, evset={:?}", fd, evset);
+                info!(
+                    "vsock: unexpected event: fd={:?}, evset={:?}",
+                    fd, event_set
+                );
                 METRICS.vsock.muxer_event_fails.inc();
             }
         }
@@ -468,8 +467,7 @@ impl VsockMuxer {
         // We might need to make room for this new connection, so let's sweep the kill queue
         // first.  It's fine to do this here because:
         // - unless the kill queue is out of sync, this is a pretty inexpensive operation; and
-        // - we are under no pressure to respect any accurate timing for connection
-        //   termination.
+        // - we are under no pressure to respect any accurate timing for connection termination.
         self.sweep_killq();
 
         if self.conn_map.len() >= defs::MAX_CONNECTIONS {
@@ -487,7 +485,7 @@ impl VsockMuxer {
                 evset: conn.get_polled_evset(),
             },
         )
-        .and_then(|_| {
+        .map(|_| {
             if conn.has_pending_rx() {
                 // We can safely ignore any error in adding a connection RX indication. Worst
                 // case scenario, the RX queue will get desynchronized, but we'll handle that
@@ -496,7 +494,6 @@ impl VsockMuxer {
             }
             self.conn_map.insert(key, conn);
             METRICS.vsock.conns_added.inc();
-            Ok(())
         })
     }
 
@@ -540,9 +537,8 @@ impl VsockMuxer {
 
         self.epoll
             .ctl(ControlOperation::Add, fd, EpollEvent::new(evset, fd as u64))
-            .and_then(|_| {
+            .map(|_| {
                 self.listener_map.insert(fd, listener);
-                Ok(())
             })
             .map_err(Error::EpollAdd)?;
 
@@ -775,13 +771,13 @@ mod tests {
     use std::ops::Drop;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
+
     use utils::tempfile::TempFile;
 
     use super::super::super::csm::defs as csm_defs;
-    use super::super::super::tests::TestContext as VsockTestContext;
     use super::*;
-
     use crate::virtio::vsock::device::RXQ_INDEX;
+    use crate::virtio::vsock::test_utils::TestContext as VsockTestContext;
 
     const PEER_CID: u64 = 3;
     const PEER_BUF_ALLOC: u32 = 64 * 1024;
@@ -800,7 +796,7 @@ mod tests {
 
     // Create a TempFile with a given prefix and return it as a nice String
     fn get_file(fprefix: &str) -> String {
-        let listener_path = TempFile::new_with_prefix(fprefix.to_owned()).unwrap();
+        let listener_path = TempFile::new_with_prefix(fprefix).unwrap();
         listener_path
             .as_path()
             .as_os_str()
@@ -829,9 +825,6 @@ mod tests {
         }
 
         fn init_pkt(&mut self, local_port: u32, peer_port: u32, op: u16) -> &mut VsockPacket {
-            for b in self.pkt.hdr_mut() {
-                *b = 0;
-            }
             self.pkt
                 .set_type(uapi::VSOCK_TYPE_STREAM)
                 .set_src_cid(PEER_CID)
@@ -848,19 +841,30 @@ mod tests {
             peer_port: u32,
             data: &[u8],
         ) -> &mut VsockPacket {
-            assert!(data.len() <= self.pkt.buf().unwrap().len() as usize);
+            assert!(data.len() <= self.pkt.buf_size());
             self.init_pkt(local_port, peer_port, uapi::VSOCK_OP_RW)
                 .set_len(data.len() as u32);
-            self.pkt.buf_mut().unwrap()[..data.len()].copy_from_slice(data);
+            self.pkt
+                .read_at_offset_from(
+                    &self._vsock_test_ctx.mem,
+                    0,
+                    &mut std::io::Cursor::new(data.to_vec()),
+                    data.len(),
+                )
+                .unwrap();
             &mut self.pkt
         }
 
         fn send(&mut self) {
-            self.muxer.send_pkt(&self.pkt).unwrap();
+            self.muxer
+                .send_pkt(&self.pkt, &self._vsock_test_ctx.mem)
+                .unwrap();
         }
 
         fn recv(&mut self) {
-            self.muxer.recv_pkt(&mut self.pkt).unwrap();
+            self.muxer
+                .recv_pkt(&mut self.pkt, &self._vsock_test_ctx.mem)
+                .unwrap();
         }
 
         fn notify_muxer(&mut self) {
@@ -972,6 +976,24 @@ mod tests {
     }
 
     #[test]
+    fn test_muxer_epoll_listener_regression() {
+        let mut ctx = MuxerTestContext::new("muxer_epoll_listener");
+        ctx.local_connect(1025);
+
+        let (_, conn) = ctx.muxer.conn_map.iter().next().unwrap();
+
+        assert_eq!(conn.get_polled_evset(), EventSet::IN);
+
+        assert_eq!(METRICS.vsock.conn_event_fails.count(), 0);
+
+        let conn_eventfd = conn.as_raw_fd();
+
+        ctx.muxer.handle_event(conn_eventfd, EventSet::OUT);
+
+        assert_eq!(METRICS.vsock.conn_event_fails.count(), 1);
+    }
+
+    #[test]
     fn test_bad_peer_pkt() {
         const LOCAL_PORT: u32 = 1026;
         const PEER_PORT: u32 = 1025;
@@ -1077,9 +1099,19 @@ mod tests {
         assert!(ctx.muxer.has_pending_rx());
         ctx.recv();
         assert_eq!(ctx.pkt.op(), uapi::VSOCK_OP_RW);
-        assert_eq!(ctx.pkt.buf().unwrap()[..data.len()], data);
         assert_eq!(ctx.pkt.src_port(), LOCAL_PORT);
         assert_eq!(ctx.pkt.dst_port(), PEER_PORT);
+
+        let mut buf = vec![];
+        ctx.pkt
+            .write_from_offset_to(
+                &ctx._vsock_test_ctx.mem,
+                0,
+                &mut buf,
+                ctx.pkt.len() as usize,
+            )
+            .unwrap();
+        assert_eq!(&buf, &data);
 
         assert!(!ctx.muxer.has_pending_rx());
     }
@@ -1109,7 +1141,17 @@ mod tests {
         assert_eq!(ctx.pkt.op(), uapi::VSOCK_OP_RW);
         assert_eq!(ctx.pkt.src_port(), local_port);
         assert_eq!(ctx.pkt.dst_port(), peer_port);
-        assert_eq!(ctx.pkt.buf().unwrap()[..data.len()], data);
+
+        let mut buf = vec![];
+        ctx.pkt
+            .write_from_offset_to(
+                &ctx._vsock_test_ctx.mem,
+                0,
+                &mut buf,
+                ctx.pkt.len() as usize,
+            )
+            .unwrap();
+        assert_eq!(&buf, &data);
     }
 
     #[test]

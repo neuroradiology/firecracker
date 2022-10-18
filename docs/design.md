@@ -46,13 +46,15 @@ The following diagram depicts an example host running Firecracker microVMs.
 images/firecracker_host_integration.png?raw=true
 "Firecracker Host Integration")
 
-Firecracker runs on Linux hosts with 4.14 or newer kernels and with Linux
-guest OSs (from this point on, referred to as guests). In production
-environments, Firecracker should be started only via the `jailer` binary.
-The `firecracker` binary can also be executed directly, but this will no longer
-be possible in the future. After launching the process, users interact with
-the Firecracker API to configure the microVM, before issuing the
-`InstanceStart` command.
+Firecracker runs on Linux hosts and with Linux guest OSs (from this point on,
+referred to as guests). For a complete list of currently supported kernel
+versions, check out the [kernel support policy](kernel-policy.md).
+
+In production environments, Firecracker should be started only via the `jailer` binary.
+See [Sandboxing](#Sandboxing) for more details.
+
+After launching the process, users interact with the Firecracker API to
+configure the microVM, before issuing the `InstanceStart` command.
 
 ### Host Networking Integration
 
@@ -143,7 +145,32 @@ Firecracker microVMs expose access to a minimal MicroVM-Metadata Service
 (MMDS) to the guest through the API endpoint. The metadata stored by the
 service is fully configured by users.
 
-### Jailing
+### Sandboxing
+
+#### __Firecracker process__
+
+Firecracker is designed to assure secure isolation using multiple layers.
+The first layer of isolation is provided by the Linux KVM and the Firecracker
+virtualization boundary. To assure defense in depth, Firecracker should only
+run constrained at the process level. This is achieved by the following:
+seccomp filters for disallowing unwanted system calls, cgroups and namespaces
+for resource isolation, and dropping privileges by jailing the process. Seccomp
+filters are automatically installed by Firecracker, while for the latter, we
+recommend starting Firecracker with the `jailer` binary that's part of each
+Firecracker release.
+
+##### Seccomp
+
+Seccomp filters are used by default to limit the host system calls Firecracker
+can use. The default filters only allow the bare minimum set of system calls
+and parameters that Firecracker needs in order to function correctly.
+
+The filters are loaded in the Firecracker process, on a per-thread basis,
+before executing any guest code.
+
+For more information, check out the [seccomp documentation](seccomp.md).
+
+#### __Jailer process__
 
 The Firecracker process can be started by another `jailer` process. The jailer
 sets up system resources that require elevated permissions (e.g., cgroup,
@@ -152,17 +179,9 @@ then runs as an unprivileged process. Past this point, Firecracker can only
 access resources that a privileged third-party grants access to (e.g., by
 copying a file into the chroot, or passing a file descriptor).
 
-Seccomp filters are used to further limit the system calls Firecracker can use.
-There are 3 possible levels of seccomp filtering, configurable by passing a
-command line argument to the jailer: 0 (disabled), 1 (whitelists a set of
-trusted system calls by their identifiers) and 2 (whitelists a set of trusted
-system calls with trusted parameter values), the latter being the most
-restrictive and the recommended one. The filters are loaded in the Firecracker
-process, immediately before the execution of the untrusted guest code starts.
+##### Cgroups and Quotas
 
-#### Cgroups and Quotas
-
-Each Firecracker microVM is further encapsulated into a cgroup. By setting the
+Each Firecracker microVM can be further encapsulated into a cgroup. By setting the
 affinity of the Firecracker microVM to a node via the cpuset subsystem, one
 can prevent the migration of said microVM from one node to another, something
 that would impair performance and cause unnecessary contention on shared

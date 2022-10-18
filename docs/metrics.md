@@ -1,8 +1,11 @@
 # Firecracker Metrics Configuration
 
-For the metrics capability, Firecracker uses a single Metrics system.
-This system can be configured by sending a `PUT` API Request to the
-`/metrics` path.
+For the metrics capability, Firecracker uses a single Metrics system. This
+system can be configured either by: a) sending a `PUT` API Request to the
+`/metrics` path: or b) using the `--metrics-path` CLI option.
+
+Note the metrics configuration is **not** part of the guest configuration and is
+not restored from a snapshot.
 
 ## Prerequisites
 
@@ -17,7 +20,15 @@ mkfifo metrics.fifo
 touch metrics.file
 ```
 
-## Configuring the system
+## Configuring the system via CLI
+
+When launching Firecracker, use the CLI option to set the metrics file.
+
+```bash
+./firecracker --metrics-path metrics.fifo
+```
+
+## Configuring the system via API
 
 You can configure the Metrics system by sending the following API command:
 
@@ -42,12 +53,12 @@ The metrics get flushed in two ways:
 
 * without user intervention every 60 seconds;
 * upon user demand, by issuing a `FlushMetrics` request. You can
-find how to use this request in the [actions API](api_requests/actions.md).
+  find how to use this request in the [actions API](api_requests/actions.md).
 
 If the path provided is a named pipe, you can use the script below to
 read from it:
 
-```shell script
+```shell
 metrics=metrics.fifo
 
 while true

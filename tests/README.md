@@ -20,6 +20,12 @@ To run tests from specific directories and/or files:
 tools/devtool test -- <test_dir_or_file_path>...
 ```
 
+To run a single specific test from a file:
+
+``` sh
+tools/devtool test -- <test_file_path>::<test_name>
+```
+
 The testing system is built around [pytest](https://docs.pytest.org/en/latest/).
 Any parameters passed to `tools/devtool test --` are passed to the `pytest`
 command. `devtool` is used to automate fetching of test dependencies (useful
@@ -53,7 +59,7 @@ For help on usage, see `tools/devtool help`.
 
 The `pytest`-powered integration tests rely on Firecracker's HTTP API for
 configuring and communicating with the VMM. Alongside these, the `vmm` crate
-also includes several [native-Rust integration tests](../vmm/tests/), which
+also includes several [native-Rust integration tests](../src/vmm/tests/), which
 exercise its programmatic API without the HTTP integration. `Cargo`
 automatically picks up these tests when `cargo test` is issued. They also count
 towards code coverage.
@@ -66,6 +72,7 @@ cargo test --test integration_tests
 
 Unlike unit tests, Rust integration tests are each run in a separate process.
 `Cargo` also packages them in a new crate. This has several known side effects:
+
 1. Only the `pub` functions can be called. This is fine, as it allows the VMM
    to be consumed as a programmatic user would. If any function is necessary
    but not `pub`, please consider carefully whether it conceptually *needs* to
@@ -248,6 +255,11 @@ local image cache.
 `A5:`
 You can speed up tests execution time with any of these:
 
+`Q6:`
+*How can I get live logger output from the tests?*
+`A6:`
+Accessing **pytest.ini** will allow you to modify logger settings.
+
 1. Run the tests from inside the container and set the environment variable
    `KEEP_TEST_SESSION` to a non-empty value.
 
@@ -259,12 +271,11 @@ You can speed up tests execution time with any of these:
    will not need to rebuild everything.
    If any Rust source file is changed, the build is done incrementally.
 
-2. Pass the `-k substring` option to Pytest to only run a subset of tests by
+1. Pass the `-k substring` option to Pytest to only run a subset of tests by
    specifying a part of their name.
 
-3. Only run the tests contained in a file or directory, as specified in the
+1. Only run the tests contained in a file or directory, as specified in the
    **Running** section.
-
 
 ## Implementation Goals
 

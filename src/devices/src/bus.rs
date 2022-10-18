@@ -9,10 +9,8 @@
 
 use std::cmp::{Ord, Ordering, PartialEq, PartialOrd};
 use std::collections::btree_map::BTreeMap;
-use std::fmt;
-use std::io;
-use std::result;
 use std::sync::{Arc, Mutex};
+use std::{fmt, result};
 
 use crate::virtio::AsAny;
 
@@ -26,10 +24,6 @@ pub trait BusDevice: AsAny + Send {
     fn read(&mut self, offset: u64, data: &mut [u8]) {}
     /// Writes at `offset` into this device
     fn write(&mut self, offset: u64, data: &[u8]) {}
-    /// Triggers the `irq_mask` interrupt on this device
-    fn interrupt(&self, irq_mask: u32) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 #[derive(Debug)]
@@ -260,9 +254,6 @@ mod tests {
 
         assert!(BusRange(0x10, 2) < BusRange(0x12, 1));
         assert!(BusRange(0x10, 2) < BusRange(0x12, 3));
-
-        let bus_range = BusRange(0x10, 2);
-        assert_eq!(bus_range, bus_range);
 
         let mut bus = Bus::new();
         let mut data = [1, 2, 3, 4];

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod actions;
+pub mod balloon;
 pub mod boot_source;
 pub mod drive;
 pub mod instance_info;
@@ -11,6 +12,7 @@ pub mod metrics;
 pub mod mmds;
 pub mod net;
 pub mod snapshot;
+pub mod version;
 pub mod vsock;
 pub use micro_http::{
     Body, HttpServer, Method, Request, RequestError, Response, StatusCode, Version,

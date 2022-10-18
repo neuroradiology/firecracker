@@ -1,10 +1,9 @@
 // Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::*;
-
 use kvm_bindings::{CpuId, KVM_CPUID_FLAG_SIGNIFCANT_INDEX};
 
+use super::*;
 use crate::bit_helper::BitHelper;
 use crate::cpu_leaf::*;
 use crate::transformer::common::use_host_cpuid_function;
@@ -130,6 +129,9 @@ pub struct AmdCpuidTransformer {}
 
 impl CpuidTransformer for AmdCpuidTransformer {
     fn process_cpuid(&self, cpuid: &mut CpuId, vm_spec: &VmSpec) -> Result<(), Error> {
+        // Some versions of kernel may return the 0xB leaf for AMD even if this is an
+        // Intel-specific leaf. Remove it.
+        cpuid.retain(|entry| entry.function != leaf_0xb::LEAF_NUM);
         use_host_cpuid_function(cpuid, leaf_0x8000001e::LEAF_NUM, false)?;
         use_host_cpuid_function(cpuid, leaf_0x8000001d::LEAF_NUM, true)?;
         self.process_entries(cpuid, vm_spec)
@@ -155,6 +157,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_process_cpuid() {
+        let vm_spec = VmSpec::new(0, 1, false).expect("Error creating vm_spec");
+        let mut cpuid = CpuId::new(0).unwrap();
+        let entry = kvm_cpuid_entry2 {
+            function: leaf_0xb::LEAF_NUM,
+            index: 0,
+            flags: 0,
+            eax: 0,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+            padding: [0, 0, 0],
+        };
+        cpuid.push(entry).unwrap();
+
+        assert!(AmdCpuidTransformer {}
+            .process_cpuid(&mut cpuid, &vm_spec)
+            .is_ok());
+        assert!(!cpuid.as_slice().contains(&entry));
+    }
+
+    #[test]
     fn test_update_structured_extended_entry() {
         use crate::cpu_leaf::leaf_0x7::index0::*;
 
@@ -167,17 +191,17 @@ mod tests {
             eax: 0,
             ebx: 0,
             ecx: 0,
-            edx: *(0 as u32).write_bit(edx::ARCH_CAPABILITIES_BITINDEX, true),
+            edx: *(0_u32).write_bit(edx::ARCH_CAPABILITIES_BITINDEX, true),
             padding: [0, 0, 0],
         };
-        assert!(update_structured_extended_entry(&mut entry, &vm_spec).is_ok());
-        assert_eq!(entry.edx.read_bit(edx::ARCH_CAPABILITIES_BITINDEX), false);
+        assert!(update_structured_extended_entry(entry, &vm_spec).is_ok());
+        assert!(!entry.edx.read_bit(edx::ARCH_CAPABILITIES_BITINDEX));
 
         // Check that if index != 0 the entry is not processed
         entry.index = 1;
         entry.edx.write_bit(edx::ARCH_CAPABILITIES_BITINDEX, true);
-        assert!(update_structured_extended_entry(&mut entry, &vm_spec).is_ok());
-        assert_eq!(entry.edx.read_bit(edx::ARCH_CAPABILITIES_BITINDEX), true);
+        assert!(update_structured_extended_entry(entry, &vm_spec).is_ok());
+        assert!(entry.edx.read_bit(edx::ARCH_CAPABILITIES_BITINDEX));
     }
 
     #[test]
@@ -185,7 +209,7 @@ mod tests {
         use crate::cpu_leaf::leaf_0x80000000::*;
 
         let vm_spec = VmSpec::new(0, 1, false).expect("Error creating vm_spec");
-        let mut entry = &mut kvm_cpuid_entry2 {
+        let entry = &mut kvm_cpuid_entry2 {
             function: LEAF_NUM,
             index: 0,
             flags: 0,
@@ -196,7 +220,7 @@ mod tests {
             padding: [0, 0, 0],
         };
 
-        assert!(update_largest_extended_fn_entry(&mut entry, &vm_spec).is_ok());
+        assert!(update_largest_extended_fn_entry(entry, &vm_spec).is_ok());
 
         assert_eq!(
             entry
@@ -211,7 +235,7 @@ mod tests {
         use crate::cpu_leaf::leaf_0x80000001::*;
 
         let vm_spec = VmSpec::new(0, 1, false).expect("Error creating vm_spec");
-        let mut entry = &mut kvm_cpuid_entry2 {
+        let entry = &mut kvm_cpuid_entry2 {
             function: LEAF_NUM,
             index: 0,
             flags: 0,
@@ -222,16 +246,19 @@ mod tests {
             padding: [0, 0, 0],
         };
 
-        assert!(update_extended_feature_info_entry(&mut entry, &vm_spec).is_ok());
+        assert!(matches!(
+            update_extended_feature_info_entry(entry, &vm_spec),
+            Ok(())
+        ));
 
-        assert_eq!(entry.ecx.read_bit(ecx::TOPOEXT_INDEX), true);
+        assert!(entry.ecx.read_bit(ecx::TOPOEXT_INDEX));
     }
 
-    fn check_update_amd_features_entry(cpu_count: u8, ht_enabled: bool) {
+    fn check_update_amd_features_entry(cpu_count: u8, smt: bool) {
         use crate::cpu_leaf::leaf_0x80000008::*;
 
-        let vm_spec = VmSpec::new(0, cpu_count, ht_enabled).expect("Error creating vm_spec");
-        let mut entry = &mut kvm_cpuid_entry2 {
+        let vm_spec = VmSpec::new(0, cpu_count, smt).expect("Error creating vm_spec");
+        let entry = &mut kvm_cpuid_entry2 {
             function: LEAF_NUM,
             index: 0,
             flags: 0,
@@ -242,7 +269,7 @@ mod tests {
             padding: [0, 0, 0],
         };
 
-        assert!(update_amd_features_entry(&mut entry, &vm_spec).is_ok());
+        assert!(update_amd_features_entry(entry, &vm_spec).is_ok());
 
         assert_eq!(
             entry.ecx.read_bits_in_range(&ecx::NUM_THREADS_BITRANGE),
@@ -257,14 +284,14 @@ mod tests {
     fn check_update_extended_apic_id_entry(
         cpu_id: u8,
         cpu_count: u8,
-        ht_enabled: bool,
+        smt: bool,
         expected_core_id: u32,
         expected_threads_per_core: u32,
     ) {
         use crate::cpu_leaf::leaf_0x8000001e::*;
 
-        let vm_spec = VmSpec::new(cpu_id, cpu_count, ht_enabled).expect("Error creating vm_spec");
-        let mut entry = &mut kvm_cpuid_entry2 {
+        let vm_spec = VmSpec::new(cpu_id, cpu_count, smt).expect("Error creating vm_spec");
+        let entry = &mut kvm_cpuid_entry2 {
             function: LEAF_NUM,
             index: 0,
             flags: 0,
@@ -275,7 +302,7 @@ mod tests {
             padding: [0, 0, 0],
         };
 
-        assert!(update_extended_apic_id_entry(&mut entry, &vm_spec).is_ok());
+        assert!(update_extended_apic_id_entry(entry, &vm_spec).is_ok());
 
         assert_eq!(
             entry
@@ -307,7 +334,7 @@ mod tests {
     #[test]
     fn test_update_extended_cache_topology_entry() {
         let vm_spec = VmSpec::new(0, 1, false).expect("Error creating vm_spec");
-        let mut entry = &mut kvm_cpuid_entry2 {
+        let entry = &mut kvm_cpuid_entry2 {
             function: leaf_0x8000001d::LEAF_NUM,
             index: 0,
             flags: 0,
@@ -318,7 +345,7 @@ mod tests {
             padding: [0, 0, 0],
         };
 
-        assert!(update_extended_cache_topology_entry(&mut entry, &vm_spec).is_ok());
+        assert!(update_extended_cache_topology_entry(entry, &vm_spec).is_ok());
 
         assert_eq!(entry.flags & KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 1);
     }

@@ -13,16 +13,16 @@ MACHINE = platform.machine()
 
 SIZES_DICT = {
     "x86_64": {
-        "FC_BINARY_SIZE_TARGET": 1955168,
-        "JAILER_BINARY_SIZE_TARGET": 1439512,
-        "FC_BINARY_SIZE_LIMIT": 2052927,
-        "JAILER_BINARY_SIZE_LIMIT": 1511488,
+        "FC_BINARY_SIZE_TARGET": 2520632,
+        "JAILER_BINARY_SIZE_TARGET": 850224,
+        "FC_BINARY_SIZE_LIMIT": 2646663,
+        "JAILER_BINARY_SIZE_LIMIT": 892735,
     },
     "aarch64": {
-        "FC_BINARY_SIZE_TARGET": 1531384,
-        "JAILER_BINARY_SIZE_TARGET": 1338312,
-        "FC_BINARY_SIZE_LIMIT": 1607953,
-        "JAILER_BINARY_SIZE_LIMIT": 1511488,
+        "FC_BINARY_SIZE_TARGET": 2322392,
+        "JAILER_BINARY_SIZE_TARGET": 851152,
+        "FC_BINARY_SIZE_LIMIT": 2438511,
+        "JAILER_BINARY_SIZE_LIMIT": 893709,
     }
 }
 
@@ -43,15 +43,36 @@ BINARY_SIZE_TOLERANCE = 0.05
 
 
 @pytest.mark.timeout(500)
-def test_binary_sizes():
-    """Test if the sizes of the release binaries are within expected ranges."""
-    fc_binary, jailer_binary = host.get_firecracker_binaries()
+def test_firecracker_binary_size():
+    """
+    Test if the size of the firecracker binary is within expected ranges.
 
-    check_binary_size("firecracker", fc_binary, FC_BINARY_SIZE_TARGET,
-                      BINARY_SIZE_TOLERANCE, FC_BINARY_SIZE_LIMIT)
+    @type: build
+    """
+    fc_binary, _ = host.get_firecracker_binaries()
 
-    check_binary_size("jailer", jailer_binary, JAILER_BINARY_SIZE_TARGET,
-                      BINARY_SIZE_TOLERANCE, JAILER_BINARY_SIZE_LIMIT)
+    result = check_binary_size("firecracker", fc_binary, FC_BINARY_SIZE_TARGET,
+                               BINARY_SIZE_TOLERANCE, FC_BINARY_SIZE_LIMIT)
+
+    return f"{result} B", \
+           f"{FC_BINARY_SIZE_TARGET} +/- {BINARY_SIZE_TOLERANCE * 100}% B"
+
+
+@pytest.mark.timeout(500)
+def test_jailer_binary_size():
+    """
+    Test if the size of the jailer binary is within expected ranges.
+
+    @type: build
+    """
+    _, jailer_binary = host.get_firecracker_binaries()
+
+    result = check_binary_size("jailer", jailer_binary,
+                               JAILER_BINARY_SIZE_TARGET,
+                               BINARY_SIZE_TOLERANCE, JAILER_BINARY_SIZE_LIMIT)
+
+    return f"{result} B", \
+           f"{JAILER_BINARY_SIZE_TARGET} +/- {BINARY_SIZE_TOLERANCE * 100}% B"
 
 
 def check_binary_size(name, binary_path, size_target, tolerance, limit):
@@ -91,3 +112,5 @@ def check_binary_size(name, binary_path, size_target, tolerance, limit):
     )
 
     assert binary_size < limit, binary_limit_msg
+
+    return binary_size

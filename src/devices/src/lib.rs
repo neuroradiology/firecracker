@@ -13,9 +13,10 @@ pub mod legacy;
 pub mod pseudo;
 pub mod virtio;
 
+use logger::{error, IncMetric, METRICS};
+
 pub use self::bus::{Bus, BusDevice, Error as BusError};
-use crate::virtio::QueueError;
-use logger::{error, Metric, METRICS};
+use crate::virtio::{QueueError, VsockError};
 
 // Function used for reporting error in terms of logging
 // but also in terms of METRICS net event fails.
@@ -33,8 +34,8 @@ pub(crate) fn report_balloon_event_fail(err: virtio::balloon::Error) {
 pub enum Error {
     /// Failed to read from the TAP device.
     FailedReadTap,
-    /// Failed to signal the virtio used queue.
-    FailedSignalingUsedQueue(io::Error),
+    /// Failed to signal irq.
+    FailedSignalingIrq(io::Error),
     /// IO error.
     IoError(io::Error),
     /// Device received malformed payload.
@@ -43,4 +44,6 @@ pub enum Error {
     MalformedDescriptor,
     /// Error during queue processing.
     QueueError(QueueError),
+    /// Vsock device error.
+    VsockError(VsockError),
 }

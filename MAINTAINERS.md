@@ -2,12 +2,18 @@
 
 Firecracker is maintained by a dedicated team within Amazon:
 
-- Alex Agache <aagch@amazon.com>
-- Adrian Catangiu <acatan@amazon.com>
 - Alexandra Iordache <aghecen@amazon.com>
-- Andreea Florescu <fandree@amazon.com>
-- Andrei Sandu <sandreim@amazon.com>
-- Dan Horobeanu <dhr@amazon.com>
+- Alexandru-Cezar Sardan <alsardan@amazon.com>
+- Andrei-Cristian Traistaru <atc@amazon.com>
+- Anton Fabian Patras <patrsap@amazon.com>
+- Babis Chalios <bchalios@amazon.com>
 - Diana Popa <dpopa@amazon.com>
-- Iulian Barbu <iul@amazon.com>
-- Serban Iorga <seriorga@amazon.com>
+- Jonathan Woollett-Light <jcawl@amazon.com>
+- Luminita Voicu <lumivo@amazon.com>
+- Marco Cali <xmarcalx@amazon.com>
+- Matthew Schlebush <schlebus@amazon.com>
+- Nikita Kalyazin <kalyazin@amazon.com>
+- Pablo Barbachano <pablob@amazon.com>
+- Patrick Roy <roypat@amazon.com>
+- Takahiro Itazuri <itazur@amazon.com>
+- Vibha Acharya <vibharya@amazon.com>

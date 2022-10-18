@@ -3,25 +3,22 @@
 """Tests ensuring security vulnerabilities are not present in dependencies."""
 
 
-import os
-import platform
 import pytest
 
-import framework.utils as utils
+from framework.utils_cpuid import CpuVendor, get_cpu_vendor
+from framework import utils
+from framework import defs
 
 
 @pytest.mark.skipif(
-    platform.machine() != "x86_64",
-    reason="The audit is based on cargo.lock which "
-           "is identical on all platforms"
+    get_cpu_vendor() != CpuVendor.INTEL,
+    reason="The audit is based on cargo.lock which " "is identical on all platforms",
 )
 def test_cargo_audit():
-    """Fail if there are crates with security vulnerabilities."""
-    cargo_lock_path = os.path.normpath(
-        os.path.join(
-            os.path.dirname(os.path.realpath(__file__)),
-            '../../../Cargo.lock')
-    )
+    """
+    Run cargo audit to check for crates with security vulnerabilities.
 
+    @type: security
+    """
     # Run command and raise exception if non-zero return code
-    utils.run_cmd('cargo audit -q -f {}'.format(cargo_lock_path))
+    utils.run_cmd("cargo audit --deny warnings -q", cwd=defs.FC_WORKSPACE_DIR)

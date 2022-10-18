@@ -12,25 +12,34 @@
 import os
 import platform
 import re
+import shutil
 import pytest
 
-import framework.utils as utils
+from framework import utils
 import host_tools.cargo_build as host  # pylint: disable=import-error
-import host_tools.proc as proc
+from host_tools import proc
+
+# We have different coverages based on the host kernel version. This is
+# caused by io_uring, which is only supported by FC for kernels newer
+# than 5.10.
 
 # AMD has a slightly different coverage due to
 # the appearance of the brand string. On Intel,
 # this contains the frequency while on AMD it does not.
 # Checkout the cpuid crate. In the future other
 # differences may appear.
-COVERAGE_DICT = {"Intel": 84.70, "AMD": 84.68}
+if utils.is_io_uring_supported():
+    COVERAGE_DICT = {"Intel": 82.99, "AMD": 82.31, "ARM": 82.41}
+else:
+    COVERAGE_DICT = {"Intel": 80.15, "AMD": 79.48, "ARM": 79.59}
+
 PROC_MODEL = proc.proc_type()
 
 COVERAGE_MAX_DELTA = 0.05
 
-CARGO_KCOV_REL_PATH = os.path.join(host.CARGO_BUILD_REL_PATH, 'kcov')
+CARGO_KCOV_REL_PATH = os.path.join(host.CARGO_BUILD_REL_PATH, "kcov")
 
-KCOV_COVERAGE_FILE = 'index.js'
+KCOV_COVERAGE_FILE = "index.js"
 """kcov will aggregate coverage data in this file."""
 
 KCOV_COVERED_LINES_REGEX = r'"covered_lines":"(\d+)"'
@@ -39,90 +48,66 @@ KCOV_COVERED_LINES_REGEX = r'"covered_lines":"(\d+)"'
 KCOV_TOTAL_LINES_REGEX = r'"total_lines" : "(\d+)"'
 """Regex for extracting number of total executable lines found by kcov."""
 
-
-@pytest.mark.timeout(120)
-@pytest.mark.skipif(
-    platform.machine() != "x86_64",
-    reason="no need to test it on multiple platforms"
-)
-def test_ensure_mod_tests():
-    """Check that files containing unit tests have a 'tests' module defined."""
-    # List all source files containing rust #[test] attribute,
-    # (excluding generated files and integration test directories).
-    # Take the list and check each file contains 'mod tests {', output file
-    # name if it doesn't.
-    cmd = (
-        '/bin/bash '
-        '-c '
-        '"grep '
-        '--files-without-match '
-        '\'mod tests {\' '
-        '\\$(grep '
-        '--files-with-matches '
-        '--recursive '
-        '--exclude-dir=src/*_gen/* '
-        '\'\\#\\[test\\]\' ../src/*/src)" '
-    )
-
-    # The outer grep returns 0 even if it finds files without the match, so we
-    # ignore the return code.
-    result = utils.run_cmd(cmd, no_shell=False, ignore_return_code=True)
-
-    error_msg = (
-        'Tests found in files without a "tests" module:\n {}'
-        'To ensure code coverage is reported correctly, please check that '
-        'your tests are in a module named "tests".'.format(result.stdout)
-    )
-
-    assert not result.stdout, error_msg
+SECCOMPILER_BUILD_DIR = "../build/seccompiler"
 
 
 @pytest.mark.timeout(400)
-@pytest.mark.skipif(
-    platform.machine() != "x86_64",
-    reason="kcov hangs on aarch64"
-)
-def test_coverage(test_session_root_path, test_session_tmp_path):
-    """Test line coverage with kcov.
+def test_coverage(test_fc_session_root_path, test_session_tmp_path):
+    """Test line coverage for rust tests is within bounds.
 
     The result is extracted from the $KCOV_COVERAGE_FILE file created by kcov
     after a coverage run.
+
+    @type: build
     """
     proc_model = [item for item in COVERAGE_DICT if item in PROC_MODEL]
     assert len(proc_model) == 1, "Could not get processor model!"
     coverage_target_pct = COVERAGE_DICT[proc_model[0]]
     exclude_pattern = (
-        '${CARGO_HOME:-$HOME/.cargo/},'
-        'build/,'
-        'tests/,'
-        'usr/lib/gcc,'
-        'lib/x86_64-linux-gnu/,'
+        "${CARGO_HOME:-$HOME/.cargo/},"
+        "build/,"
+        "tests/,"
+        "usr/lib/gcc,"
+        "lib/x86_64-linux-gnu/,"
+        "test_utils.rs,"
         # The following files/directories are auto-generated
-        'bootparam.rs,'
-        'elf.rs,'
-        'mpspec.rs,'
-        'msr_index.rs,'
-        '_gen'
+        "bootparam.rs,"
+        "elf.rs,"
+        "mpspec.rs,"
+        "msr_index.rs,"
+        "bindings.rs,"
+        "_gen"
     )
-    exclude_region = '\'mod tests {\''
+    exclude_region = "'mod tests {'"
+    target = "{}-unknown-linux-musl".format(platform.machine())
 
     cmd = (
-        'CARGO_TARGET_DIR={} cargo kcov --all '
-        '--output {} -- '
-        '--exclude-pattern={} '
-        '--exclude-region={} --verify'
+        'CARGO_WRAPPER="kcov" RUSTFLAGS="{}" CARGO_TARGET_DIR={} '
+        "cargo kcov --all "
+        "--target {} --output {} -- "
+        "--exclude-pattern={} "
+        "--exclude-region={} --verify"
     ).format(
-        os.path.join(test_session_root_path, CARGO_KCOV_REL_PATH),
+        host.get_rustflags(),
+        os.path.join(test_fc_session_root_path, CARGO_KCOV_REL_PATH),
+        target,
         test_session_tmp_path,
         exclude_pattern,
-        exclude_region
+        exclude_region,
     )
+    # We remove the seccompiler custom build directory, created by the
+    # vmm-level `build.rs`.
+    # If we don't delete it before and after running the kcov command, we will
+    # run into linker errors.
+    shutil.rmtree(SECCOMPILER_BUILD_DIR, ignore_errors=True)
     # By default, `cargo kcov` passes `--exclude-pattern=$CARGO_HOME --verify`
     # to kcov. To pass others arguments, we need to include the defaults.
     utils.run_cmd(cmd)
 
+    shutil.rmtree(SECCOMPILER_BUILD_DIR)
+
     coverage_file = os.path.join(test_session_tmp_path, KCOV_COVERAGE_FILE)
-    with open(coverage_file) as cov_output:
+    with open(coverage_file, encoding="utf-8") as cov_output:
         contents = cov_output.read()
         covered_lines = int(re.findall(KCOV_COVERED_LINES_REGEX, contents)[0])
         total_lines = int(re.findall(KCOV_TOTAL_LINES_REGEX, contents)[0])
@@ -132,23 +117,26 @@ def test_coverage(test_session_root_path, test_session_tmp_path):
     print("Thus, coverage is: {:.2f}%".format(coverage))
 
     coverage_low_msg = (
-        'Current code coverage ({:.2f}%) is below the target ({}%).'
-        .format(coverage, coverage_target_pct)
+        "Current code coverage ({:.2f}%) is >{:.2f}% below the target ({}%).".format(
+            coverage, COVERAGE_MAX_DELTA, coverage_target_pct
+        )
     )
 
-    min_coverage = coverage_target_pct - COVERAGE_MAX_DELTA
-    assert coverage >= min_coverage, coverage_low_msg
+    assert coverage >= coverage_target_pct - COVERAGE_MAX_DELTA, coverage_low_msg
 
     # Get the name of the variable that needs updating.
     namespace = globals()
-    cov_target_name = [name for name in namespace if namespace[name]
-                       is COVERAGE_DICT][0]
+    cov_target_name = [name for name in namespace if namespace[name] is COVERAGE_DICT][
+        0
+    ]
 
     coverage_high_msg = (
-        'Current code coverage ({:.2f}%) is above the target ({}%).\n'
-        'Please update the value of {}.'
-        .format(coverage, coverage_target_pct, cov_target_name)
+        "Current code coverage ({:.2f}%) is >{:.2f}% above the target ({}%).\n"
+        "Please update the value of {}.".format(
+            coverage, COVERAGE_MAX_DELTA, coverage_target_pct, cov_target_name
+        )
     )
 
-    assert coverage - coverage_target_pct <= COVERAGE_MAX_DELTA,\
-        coverage_high_msg
+    assert coverage <= coverage_target_pct + COVERAGE_MAX_DELTA, coverage_high_msg
+
+    return (f"{coverage}%", f"{coverage_target_pct}% +/- {COVERAGE_MAX_DELTA * 100}%")

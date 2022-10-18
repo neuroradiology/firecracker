@@ -29,7 +29,7 @@ you want to merge your changes to Firecracker:
 1. Create your contribution, meeting all
    [contribution quality standards](#contribution-quality-standards)
 1. [Create a pull request](https://help.github.com/articles/creating-a-pull-request-from-a-fork/)
-   against the master branch of the Firecracker repository.
+   against the main branch of the Firecracker repository.
 1. Add two reviewers to your pull request (a maintainer will do that for you if
    you're new). Work with your reviewers to address any comments and obtain a
    minimum of 2 approvals, at least one of which must be provided by
@@ -48,7 +48,7 @@ If you just want to receive feedback for a contribution proposal, open an “RFC
    branch for the contribution you want feedback on. Use a meaningful name.
 1. Create your proposal based on the existing codebase.
 1. [Create a pull request](https://help.github.com/articles/creating-a-pull-request-from-a-fork/)
-   against the master branch of the Firecracker repository. Prefix your pull
+   against the main branch of the Firecracker repository. Prefix your pull
    request name with `[RFC]`.
 1. Discuss your proposal with the community on the pull request page (or on any
    other channel). Add the conclusion(s) of this discussion to the pull request
@@ -57,7 +57,15 @@ If you just want to receive feedback for a contribution proposal, open an “RFC
 ## Contribution Quality Standards
 
 Most quality and style standards are enforced automatically during integration
-testing. Your contribution needs to meet the following standards:
+testing. For ease of use you can setup a git pre-commit hook by running the
+following in the Firecracker root directory:
+
+```
+cargo install rusty-hook
+rusty-hook init
+```
+
+Your contribution needs to meet the following standards:
 
 - Separate each **logical change** into its own commit.
 - Each commit must pass all unit & code style tests, and the full pull request
@@ -68,6 +76,17 @@ testing. Your contribution needs to meet the following standards:
 - Document all your public functions.
 - Add a descriptive message for each commit. Follow
   [commit message best practices](https://github.com/erlang/otp/wiki/writing-good-commit-messages).
+- A good commit message may look like
+
+  ```
+  A descriptive title of 50 characters or fewer
+
+  A concise description where each line is 72 characters or fewer.
+
+  Signed-off-by: <A full name> <A email>
+  Co-authored-by: <B full name> <B email>
+  ```
+
 - Document your pull requests. Include the reasoning behind each change, and
   the testing done.
 - Acknowledge Firecracker's [Apache 2.0 license](LICENSE) and certify that no

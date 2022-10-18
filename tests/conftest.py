@@ -1,5 +1,9 @@
 # Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+
+# Pytest fixtures and redefined-outer-name don't mix well. Disable it.
+# pylint:disable=redefined-outer-name
+
 """Imported by pytest at the start of every test session.
 
 # Fixture Goals
@@ -81,31 +85,22 @@ import shutil
 import sys
 import tempfile
 import uuid
+import json
 
 import pytest
 
 import host_tools.cargo_build as build_tools
 import host_tools.network as net_tools
-
-import framework.utils as utils
+from host_tools import proc
+from framework import utils
+from framework import defs
+from framework.artifacts import ArtifactCollection
 from framework.microvm import Microvm
 from framework.s3fetcher import MicrovmImageS3Fetcher
 from framework.scheduler import PytestScheduler
 
-
-SPEC_S3_BUCKET = 'spec.ccfc.min'
-"""The s3 bucket that holds global Firecracker specifications."""
-
-DEFAULT_TEST_IMAGES_S3_BUCKET = 'spec.ccfc.min'
-"""The default s3 bucket that holds Firecracker microvm test images."""
-
-ENV_TEST_IMAGES_S3_BUCKET = 'TEST_MICROVM_IMAGES_S3_BUCKET'
-"""Environment variable for configuring the test microvm s3 bucket.
-
-If variable exists in `os.environ`, its value will be used as the s3 bucket
-for microvm test images.
-"""
-
+# Tests root directory.
+SCRIPT_FOLDER = os.path.dirname(os.path.realpath(__file__))
 
 # This codebase uses Python features available in Python 3.6 or above
 if sys.version_info < (3, 6):
@@ -117,30 +112,96 @@ if os.geteuid() != 0:
     raise PermissionError("Test session needs to be run as root.")
 
 
+# Style related tests and dependency enforcements are run only on Intel.
+if "Intel" not in proc.proc_type():
+    TEST_DIR = "integration_tests"
+    collect_ignore = [
+        os.path.join(SCRIPT_FOLDER, "{}/style".format(TEST_DIR)),
+        os.path.join(SCRIPT_FOLDER, "{}/build/test_dependencies.py".format(TEST_DIR)),
+    ]
+
+
 def _test_images_s3_bucket():
     """Auxiliary function for getting this session's bucket name."""
     return os.environ.get(
-        ENV_TEST_IMAGES_S3_BUCKET,
-        DEFAULT_TEST_IMAGES_S3_BUCKET
+        defs.ENV_TEST_IMAGES_S3_BUCKET, defs.DEFAULT_TEST_IMAGES_S3_BUCKET
     )
 
 
+ARTIFACTS_COLLECTION = ArtifactCollection(_test_images_s3_bucket())
 MICROVM_S3_FETCHER = MicrovmImageS3Fetcher(_test_images_s3_bucket())
 
 
-def init_microvm(root_path, bin_cloner_path):
+# pylint: disable=too-few-public-methods
+class ResultsDumperInterface:
+    """Interface for dumping results to file."""
+
+    def dump(self, result):
+        """Dump the results in JSON format."""
+
+
+# pylint: disable=too-few-public-methods
+class NopResultsDumper(ResultsDumperInterface):
+    """Interface for dummy dumping results to file."""
+
+    def dump(self, result):
+        """Do not do anything."""
+
+
+# pylint: disable=too-few-public-methods
+class JsonFileDumper(ResultsDumperInterface):
+    """Class responsible with outputting test results to files."""
+
+    def __init__(self, request):
+        """Initialize the instance."""
+        self._results_file = None
+
+        test_name = request.node.originalname
+        self._root_path = defs.TEST_RESULTS_DIR
+        # Create the root directory, if it doesn't exist.
+        self._root_path.mkdir(exist_ok=True)
+        self._results_file = os.path.join(
+            self._root_path,
+            "{}_results_{}.json".format(test_name, utils.get_kernel_version(level=1)),
+        )
+
+    @staticmethod
+    def __dump_pretty_json(file, data, flags):
+        """Write the `data` dictionary to the output file in pretty format."""
+        with open(file, flags, encoding="utf-8") as file_fd:
+            json.dump(data, file_fd, indent=4)
+            file_fd.write("\n")  # Add newline cause Py JSON does not
+            file_fd.flush()
+
+    def dump(self, result):
+        """Dump the results in JSON format."""
+        if self._results_file:
+            self.__dump_pretty_json(self._results_file, result, "a")
+
+
+def init_microvm(root_path, bin_cloner_path, fc_binary=None, jailer_binary=None):
     """Auxiliary function for instantiating a microvm and setting it up."""
-    # pylint: disable=redefined-outer-name
-    # The fixture pattern causes a pylint false positive for that rule.
     microvm_id = str(uuid.uuid4())
-    fc_binary, jailer_binary = build_tools.get_firecracker_binaries()
+
+    # Update permissions for custom binaries.
+    if fc_binary is not None:
+        os.chmod(fc_binary, 0o555)
+    if jailer_binary is not None:
+        os.chmod(jailer_binary, 0o555)
+
+    if fc_binary is None or jailer_binary is None:
+        fc_binary, jailer_binary = build_tools.get_firecracker_binaries()
+
+    # Make sure we always have both binaries.
+    assert fc_binary
+    assert jailer_binary
 
     vm = Microvm(
         resource_path=root_path,
         fc_binary_path=fc_binary,
         jailer_binary_path=jailer_binary,
         microvm_id=microvm_id,
-        bin_cloner_path=bin_cloner_path
+        bin_cloner_path=bin_cloner_path,
     )
     vm.setup()
     return vm
@@ -151,6 +212,7 @@ def pytest_configure(config):
 
     Initialize the test scheduler and IPC services.
     """
+    config.addinivalue_line("markers", "nonci: mark test as nonci.")
     PytestScheduler.instance().register_mp_singleton(
         net_tools.UniqueIPv4Generator.instance()
     )
@@ -158,174 +220,207 @@ def pytest_configure(config):
 
 
 def pytest_addoption(parser):
-    """Pytest hook. Add concurrency command line option.
-
-    For some reason, pytest doesn't properly pick up this hook in our plugin
-    class, so we need to call it from here.
-    """
+    """Pytest hook. Add command line options."""
+    parser.addoption(
+        "--dump-results-to-file",
+        action="store_true",
+        help="Flag to dump test results to the test_results folder.",
+    )
     return PytestScheduler.instance().do_pytest_addoption(parser)
 
 
-@pytest.fixture(autouse=True, scope='session')
 def test_session_root_path():
-    """Ensure and yield the testrun root directory.
+    """Create and return the testrun session root directory.
 
-    Created at session initialization time, this directory will be
-    session-unique. This is important, since the scheduler will run
-    multiple pytest sessions concurrently.
+    Testrun session root directory confines any other test temporary file.
+    If it exists, consider this as a noop.
     """
-    root_path = tempfile.mkdtemp(prefix="fctest-")
+    os.makedirs(defs.DEFAULT_TEST_SESSION_ROOT_PATH, exist_ok=True)
+    return defs.DEFAULT_TEST_SESSION_ROOT_PATH
 
-    yield root_path
 
-    shutil.rmtree(root_path)
+@pytest.fixture(autouse=True, scope="session")
+def test_fc_session_root_path():
+    """Ensure and yield the fc session root directory.
+
+    Create a unique temporary session directory. This is important, since the
+    scheduler will run multiple pytest sessions concurrently.
+    """
+    fc_session_root_path = tempfile.mkdtemp(
+        prefix="fctest-", dir=f"{test_session_root_path()}"
+    )
+    yield fc_session_root_path
+    shutil.rmtree(fc_session_root_path)
 
 
 @pytest.fixture
-def test_session_tmp_path(test_session_root_path):
+def test_session_tmp_path(test_fc_session_root_path):
     """Yield a random temporary directory. Destroyed on teardown."""
-    # pylint: disable=redefined-outer-name
-    # The fixture pattern causes a pylint false positive for that rule.
 
-    tmp_path = tempfile.mkdtemp(prefix=test_session_root_path)
+    tmp_path = tempfile.mkdtemp(prefix=test_fc_session_root_path)
     yield tmp_path
     shutil.rmtree(tmp_path)
 
 
+@pytest.fixture
+def results_file_dumper(request):
+    """Yield the custom --dump-results-to-file test flag."""
+    if request.config.getoption("--dump-results-to-file"):
+        return JsonFileDumper(request)
+
+    return NopResultsDumper()
+
+
 def _gcc_compile(src_file, output_file, extra_flags="-static -O3"):
     """Build a source file with gcc."""
-    compile_cmd = 'gcc {} -o {} {}'.format(
-        src_file,
-        output_file,
-        extra_flags
-    )
+    compile_cmd = "gcc {} -o {} {}".format(src_file, output_file, extra_flags)
     utils.run_cmd(compile_cmd)
 
 
-@pytest.fixture(scope='session')
-def bin_cloner_path(test_session_root_path):
+@pytest.fixture(scope="session")
+def bin_cloner_path(test_fc_session_root_path):
     """Build a binary that `clone`s into the jailer.
 
     It's necessary because Python doesn't interface well with the `clone()`
     syscall directly.
     """
-    # pylint: disable=redefined-outer-name
-    # The fixture pattern causes a pylint false positive for that rule.
-    cloner_bin_path = os.path.join(test_session_root_path, 'newpid_cloner')
-    _gcc_compile(
-        'host_tools/newpid_cloner.c',
-        cloner_bin_path
-    )
+    cloner_bin_path = os.path.join(test_fc_session_root_path, "newpid_cloner")
+    _gcc_compile("host_tools/newpid_cloner.c", cloner_bin_path)
     yield cloner_bin_path
 
 
-@pytest.fixture(scope='session')
-def bin_vsock_path(test_session_root_path):
+@pytest.fixture(scope="session")
+def bin_vsock_path(test_fc_session_root_path):
     """Build a simple vsock client/server application."""
-    # pylint: disable=redefined-outer-name
-    # The fixture pattern causes a pylint false positive for that rule.
-    vsock_helper_bin_path = os.path.join(
-        test_session_root_path,
-        'vsock_helper'
-    )
-    _gcc_compile(
-        'host_tools/vsock_helper.c',
-        vsock_helper_bin_path
-    )
+    vsock_helper_bin_path = os.path.join(test_fc_session_root_path, "vsock_helper")
+    _gcc_compile("host_tools/vsock_helper.c", vsock_helper_bin_path)
     yield vsock_helper_bin_path
 
 
-@pytest.fixture(scope='session')
-def change_net_config_space_bin(test_session_root_path):
+@pytest.fixture(scope="session")
+def change_net_config_space_bin(test_fc_session_root_path):
     """Build a binary that changes the MMIO config space."""
-    # pylint: disable=redefined-outer-name
     change_net_config_space_bin = os.path.join(
-        test_session_root_path,
-        'change_net_config_space'
+        test_fc_session_root_path, "change_net_config_space"
     )
     _gcc_compile(
-        'host_tools/change_net_config_space.c',
+        "host_tools/change_net_config_space.c",
         change_net_config_space_bin,
-        extra_flags=""
+        extra_flags="",
     )
     yield change_net_config_space_bin
 
 
-@pytest.fixture(scope='session')
-def bin_seccomp_paths(test_session_root_path):
+@pytest.fixture(scope="session")
+def bin_seccomp_paths(test_fc_session_root_path):
     """Build jailers and jailed binaries to test seccomp.
 
     They currently consist of:
 
-    * a jailer with a simple syscall whitelist;
-    * a jailer with a (syscall, arguments) advanced whitelist;
+    * a jailer that receives filter generated using seccompiler-bin;
     * a jailed binary that follows the seccomp rules;
     * a jailed binary that breaks the seccomp rules.
     """
-    # pylint: disable=redefined-outer-name
-    # The fixture pattern causes a pylint false positive for that rule.
     seccomp_build_path = os.path.join(
-        test_session_root_path,
-        build_tools.CARGO_RELEASE_REL_PATH
+        test_fc_session_root_path, build_tools.CARGO_RELEASE_REL_PATH
     )
 
-    extra_args = '--release --target {}-unknown-linux-musl'
+    extra_args = "--release --target {}-unknown-linux-musl"
     extra_args = extra_args.format(platform.machine())
-    build_tools.cargo_build(seccomp_build_path,
-                            extra_args=extra_args,
-                            src_dir='integration_tests/security/demo_seccomp')
+    build_tools.cargo_build(
+        seccomp_build_path,
+        extra_args=extra_args,
+        src_dir="integration_tests/security/demo_seccomp",
+    )
 
     release_binaries_path = os.path.join(
-        test_session_root_path,
+        test_fc_session_root_path,
         build_tools.CARGO_RELEASE_REL_PATH,
-        build_tools.RELEASE_BINARIES_REL_PATH
+        build_tools.RELEASE_BINARIES_REL_PATH,
     )
 
-    demo_basic_jailer = os.path.normpath(
-        os.path.join(
-            release_binaries_path,
-            'demo_basic_jailer'
-        )
-    )
-    demo_advanced_jailer = os.path.normpath(
-        os.path.join(
-            release_binaries_path,
-            'demo_advanced_jailer'
-        )
-    )
+    demo_jailer = os.path.normpath(os.path.join(release_binaries_path, "demo_jailer"))
     demo_harmless = os.path.normpath(
-        os.path.join(
-            release_binaries_path,
-            'demo_harmless'
-        )
+        os.path.join(release_binaries_path, "demo_harmless")
     )
     demo_malicious = os.path.normpath(
-        os.path.join(
-            release_binaries_path,
-            'demo_malicious'
-        )
+        os.path.join(release_binaries_path, "demo_malicious")
+    )
+    demo_panic = os.path.normpath(os.path.join(release_binaries_path, "demo_panic"))
+
+    yield {
+        "demo_jailer": demo_jailer,
+        "demo_harmless": demo_harmless,
+        "demo_malicious": demo_malicious,
+        "demo_panic": demo_panic,
+    }
+
+
+@pytest.fixture(scope="session")
+def uffd_handler_paths(test_fc_session_root_path):
+    """Build UFFD handler binaries."""
+    uffd_build_path = os.path.join(
+        test_fc_session_root_path, build_tools.CARGO_RELEASE_REL_PATH
+    )
+
+    extra_args = "--release --target {}-unknown-linux-musl"
+    extra_args = extra_args.format(platform.machine())
+    build_tools.cargo_build(
+        uffd_build_path, extra_args=extra_args, src_dir="host_tools/uffd"
+    )
+
+    release_binaries_path = os.path.join(
+        test_fc_session_root_path,
+        build_tools.CARGO_RELEASE_REL_PATH,
+        build_tools.RELEASE_BINARIES_REL_PATH,
+    )
+
+    valid_handler = os.path.normpath(
+        os.path.join(release_binaries_path, "valid_handler")
+    )
+
+    malicious_handler = os.path.normpath(
+        os.path.join(release_binaries_path, "malicious_handler")
     )
 
     yield {
-        'demo_basic_jailer': demo_basic_jailer,
-        'demo_advanced_jailer': demo_advanced_jailer,
-        'demo_harmless': demo_harmless,
-        'demo_malicious': demo_malicious
+        "valid_handler": valid_handler,
+        "malicious_handler": malicious_handler,
     }
 
 
 @pytest.fixture()
-def microvm(test_session_root_path, bin_cloner_path):
+def microvm(test_fc_session_root_path, bin_cloner_path):
     """Instantiate a microvm."""
-    # pylint: disable=redefined-outer-name
-    # The fixture pattern causes a pylint false positive for that rule.
-
     # Make sure the necessary binaries are there before instantiating the
     # microvm.
-    vm = init_microvm(test_session_root_path, bin_cloner_path)
+    vm = init_microvm(test_fc_session_root_path, bin_cloner_path)
     yield vm
     vm.kill()
-    shutil.rmtree(os.path.join(test_session_root_path, vm.id))
+    shutil.rmtree(os.path.join(test_fc_session_root_path, vm.id))
+
+
+@pytest.fixture()
+def microvm_factory(tmp_path, bin_cloner_path):
+    """Fixture to create microvms simply.
+
+    By using tmp_path, the last 3 runs are kept. This may be a problem when
+    running large number of tests, but it's very handy for debugging.
+    """
+
+    class MicroVMFactory:
+        """MicroVM factory"""
+
+        def __init__(self, tmp_path, bin_cloner):
+            self.tmp_path = tmp_path
+            self.bin_cloner_path = bin_cloner
+
+        def build(self):
+            """Build a fresh microvm."""
+            vm = init_microvm(self.tmp_path, self.bin_cloner_path)
+            return vm
+
+    yield MicroVMFactory(tmp_path, bin_cloner_path)
 
 
 @pytest.fixture
@@ -334,11 +429,7 @@ def network_config():
     yield net_tools.UniqueIPv4Generator.instance()
 
 
-@pytest.fixture(
-    params=MICROVM_S3_FETCHER.list_microvm_images(
-        capability_filter=['*']
-    )
-)
+@pytest.fixture(params=MICROVM_S3_FETCHER.list_microvm_images(capability_filter=["*"]))
 def test_microvm_any(request, microvm):
     """Yield a microvm that can have any image in the spec bucket.
 
@@ -351,19 +442,13 @@ def test_microvm_any(request, microvm):
     test cases for each test that depends on this fixture, each receiving a
     microvm instance with a different microvm image.
     """
-    # pylint: disable=redefined-outer-name
-    # The fixture pattern causes a pylint false positive for that rule.
 
     MICROVM_S3_FETCHER.init_vm_resources(request.param, microvm)
     yield microvm
 
 
 @pytest.fixture
-def test_multiple_microvms(
-        test_session_root_path,
-        context,
-        bin_cloner_path
-):
+def test_multiple_microvms(test_fc_session_root_path, context, bin_cloner_path):
     """Yield one or more microvms based on the context provided.
 
     `context` is a dynamically parameterized fixture created inside the special
@@ -371,37 +456,51 @@ def test_multiple_microvms(
     of the guest image used to spawn a microvm and the number of microvms
     to spawn.
     """
-    # pylint: disable=redefined-outer-name
-    # The fixture pattern causes a pylint false positive for that rule.
     microvms = []
     (microvm_resources, how_many) = context
 
     # When the context specifies multiple microvms, we use the first vm to
     # populate the other ones by hardlinking its resources.
-    first_vm = init_microvm(test_session_root_path, bin_cloner_path)
-    MICROVM_S3_FETCHER.init_vm_resources(
-        microvm_resources,
-        first_vm
-    )
+    first_vm = init_microvm(test_fc_session_root_path, bin_cloner_path)
+    MICROVM_S3_FETCHER.init_vm_resources(microvm_resources, first_vm)
     microvms.append(first_vm)
 
     # It is safe to do this as the dynamically generated fixture `context`
     # asserts that the `how_many` parameter is always positive
     # (i.e strictly greater than 0).
     for _ in range(how_many - 1):
-        vm = init_microvm(test_session_root_path, bin_cloner_path)
-        MICROVM_S3_FETCHER.hardlink_vm_resources(
-            microvm_resources,
-            first_vm,
-            vm
-        )
+        vm = init_microvm(test_fc_session_root_path, bin_cloner_path)
+        MICROVM_S3_FETCHER.hardlink_vm_resources(microvm_resources, first_vm, vm)
         microvms.append(vm)
 
     yield microvms
 
     for i in range(how_many):
         microvms[i].kill()
-        shutil.rmtree(os.path.join(test_session_root_path, microvms[i].id))
+        shutil.rmtree(os.path.join(test_fc_session_root_path, microvms[i].id))
+
+
+@pytest.fixture(autouse=True, scope="session")
+def test_spectre_mitigations():
+    """Check the kernel is compiled with SPECTREv2 mitigations."""
+
+    def x86_64(body):
+        return ("IBPB: conditional" in body or "IBPB: always-on" in body) and (
+            "Enhanced IBRS" in body or "IBRS" in body
+        )
+
+    def aarch64(body):
+        return "Mitigation: CSV2, BHB" in body or "Not affected" in body
+
+    arch = platform.machine()
+    assert arch in ("x86_64", "aarch64"), f"Unsupported arch {arch}"
+
+    body = open(
+        "/sys/devices/system/cpu/vulnerabilities/spectre_v2", encoding="utf-8"
+    ).read()
+
+    mitigated = x86_64(body) if arch == "x86_64" else aarch64(body)
+    assert mitigated, "SPECTREv2 not mitigated {}".format(body)
 
 
 def pytest_generate_tests(metafunc):
@@ -419,31 +518,27 @@ def pytest_generate_tests(metafunc):
     For each parameter from the list (i.e. tuple) a different test case
     scenario will be created.
     """
-    if 'context' in metafunc.fixturenames:
+    if "context" in metafunc.fixturenames:
         # In order to create the params for the current fixture, we need the
         # capability and the number of vms we want to spawn.
 
         # 1. Look if the test function set the pool size through the decorator.
         # If it did not, we set it to 1.
-        how_many = int(getattr(metafunc.function, '_pool_size', None))
+        how_many = int(getattr(metafunc.function, "_pool_size", None))
         assert how_many > 0
 
         # 2. Check if the test function set the capability field through
         # the decorator. If it did not, we set it to any.
-        cap = getattr(metafunc.function, '_capability', '*')
+        cap = getattr(metafunc.function, "_capability", "*")
 
         # 3. Before parametrization, get the list of images that have the
         # desired capability. By parametrize-ing the fixture with it, we
         # trigger tests cases for each of them.
-        image_list = MICROVM_S3_FETCHER.list_microvm_images(
-            capability_filter=[cap]
-        )
+        image_list = MICROVM_S3_FETCHER.list_microvm_images(capability_filter=[cap])
         metafunc.parametrize(
-            'context',
+            "context",
             [(item, how_many) for item in image_list],
-            ids=['{}, {} instance(s)'.format(
-                item, how_many
-            ) for item in image_list]
+            ids=["{}, {} instance(s)".format(item, how_many) for item in image_list],
         )
 
 
@@ -465,8 +560,8 @@ TEST_MICROVM_CAP_FIXTURE_TEMPLATE = (
 # provide a way to do that outright, but luckily all of python is just lists of
 # of lists and a cursor, so exec() works fine here.
 for capability in MICROVM_S3_FETCHER.enum_capabilities():
-    TEST_MICROVM_CAP_FIXTURE = (
-        TEST_MICROVM_CAP_FIXTURE_TEMPLATE.replace('CAP', capability)
+    TEST_MICROVM_CAP_FIXTURE = TEST_MICROVM_CAP_FIXTURE_TEMPLATE.replace(
+        "CAP", capability
     )
     # pylint: disable=exec-used
     # This is the most straightforward way to achieve this result.

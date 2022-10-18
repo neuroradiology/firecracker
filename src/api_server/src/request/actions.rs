@@ -1,14 +1,14 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use logger::{IncMetric, METRICS};
+use serde::{Deserialize, Serialize};
+
 use super::super::VmmAction;
 use crate::parsed_request::{Error, ParsedRequest};
 use crate::request::Body;
 #[cfg(target_arch = "aarch64")]
 use crate::request::StatusCode;
-use logger::{Metric, METRICS};
-
-use serde::{Deserialize, Serialize};
 
 // The names of the members from this enum must precisely correspond (as a string) to the possible
 // values of "action_type" from the json request body. This is useful to get a strongly typed
@@ -28,11 +28,11 @@ struct ActionBody {
     action_type: ActionType,
 }
 
-pub fn parse_put_actions(body: &Body) -> Result<ParsedRequest, Error> {
+pub(crate) fn parse_put_actions(body: &Body) -> Result<ParsedRequest, Error> {
     METRICS.put_api_requests.actions_count.inc();
-    let action_body = serde_json::from_slice::<ActionBody>(body.raw()).map_err(|e| {
+    let action_body = serde_json::from_slice::<ActionBody>(body.raw()).map_err(|err| {
         METRICS.put_api_requests.actions_fails.inc();
-        Error::SerdeJson(e)
+        err
     })?;
 
     match action_body.action_type {

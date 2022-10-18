@@ -6,14 +6,18 @@ import host_tools.network as net_tools  # pylint: disable=import-error
 MAX_VCPUS = 32
 
 
-def test_max_vcpus(test_microvm_with_ssh, network_config):
-    """Test if all configured guest vcpus are online."""
-    microvm = test_microvm_with_ssh
+def test_max_vcpus(test_microvm_with_api, network_config):
+    """
+    Test if all configured guest vcpus are online.
+
+    @type: functional
+    """
+    microvm = test_microvm_with_api
     microvm.spawn()
 
     # Configure a microVM with 32 vCPUs.
     microvm.basic_config(vcpu_count=MAX_VCPUS)
-    _tap, _, _ = microvm.ssh_network_config(network_config, '1')
+    _tap, _, _ = microvm.ssh_network_config(network_config, "1")
 
     microvm.start()
 

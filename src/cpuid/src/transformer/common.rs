@@ -1,12 +1,11 @@
 // Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use kvm_bindings::{kvm_cpuid_entry2, CpuId};
+
 use super::*;
 use crate::bit_helper::BitHelper;
 use crate::common::get_cpuid;
-
-use crate::transformer::Error::FamError;
-use kvm_bindings::{kvm_cpuid_entry2, CpuId};
 
 // constants for setting the fields of kvm_cpuid2 structures
 // CPUID bits in ebx, ecx, and edx.
@@ -62,10 +61,10 @@ pub fn update_brand_string_entry(
     vm_spec: &VmSpec,
 ) -> Result<(), Error> {
     let brand_string = &vm_spec.brand_string;
-    entry.eax = brand_string.get_reg_for_leaf(entry.function, BsReg::EAX);
-    entry.ebx = brand_string.get_reg_for_leaf(entry.function, BsReg::EBX);
-    entry.ecx = brand_string.get_reg_for_leaf(entry.function, BsReg::ECX);
-    entry.edx = brand_string.get_reg_for_leaf(entry.function, BsReg::EDX);
+    entry.eax = brand_string.get_reg_for_leaf(entry.function, BsReg::Eax);
+    entry.ebx = brand_string.get_reg_for_leaf(entry.function, BsReg::Ebx);
+    entry.ecx = brand_string.get_reg_for_leaf(entry.function, BsReg::Ecx);
+    entry.edx = brand_string.get_reg_for_leaf(entry.function, BsReg::Edx);
 
     Ok(())
 }
@@ -126,7 +125,7 @@ pub fn use_host_cpuid_function(
                 edx: entry.edx,
                 padding: [0, 0, 0],
             })
-            .map_err(FamError)?;
+            .map_err(Error::Fam)?;
 
         count += 1;
     }
@@ -136,10 +135,11 @@ pub fn use_host_cpuid_function(
 
 #[cfg(test)]
 mod tests {
+    use kvm_bindings::kvm_cpuid_entry2;
+
     use super::*;
     use crate::common::tests::get_topoext_fn;
     use crate::transformer::VmSpec;
-    use kvm_bindings::kvm_cpuid_entry2;
 
     #[test]
     fn test_get_max_cpus_per_package() {
@@ -155,7 +155,7 @@ mod tests {
         use crate::cpu_leaf::leaf_0x1::*;
 
         let vm_spec = VmSpec::new(0, cpu_count, false).expect("Error creating vm_spec");
-        let mut entry = &mut kvm_cpuid_entry2 {
+        let entry = &mut kvm_cpuid_entry2 {
             function: 0x0,
             index: 0,
             flags: 0,
@@ -166,33 +166,33 @@ mod tests {
             padding: [0, 0, 0],
         };
 
-        assert!(update_feature_info_entry(&mut entry, &vm_spec).is_ok());
+        assert!(matches!(update_feature_info_entry(entry, &vm_spec), Ok(())));
 
         assert_eq!(entry.edx.read_bit(edx::HTT_BITINDEX), expected_htt);
-        assert_eq!(entry.ecx.read_bit(ecx::TSC_DEADLINE_TIMER_BITINDEX), true);
+        assert!(entry.ecx.read_bit(ecx::TSC_DEADLINE_TIMER_BITINDEX));
     }
 
     fn check_update_cache_parameters_entry(
         cpu_count: u8,
-        ht_enabled: bool,
+        smt: bool,
         cache_level: u32,
         expected_max_cpus_per_core: u32,
     ) {
         use crate::cpu_leaf::leaf_cache_parameters::*;
 
-        let vm_spec = VmSpec::new(0, cpu_count, ht_enabled).expect("Error creating vm_spec");
-        let mut entry = &mut kvm_cpuid_entry2 {
+        let vm_spec = VmSpec::new(0, cpu_count, smt).expect("Error creating vm_spec");
+        let entry = &mut kvm_cpuid_entry2 {
             function: 0x0,
             index: 0,
             flags: 0,
-            eax: *(0 as u32).write_bits_in_range(&eax::CACHE_LEVEL_BITRANGE, cache_level),
+            eax: *(0_u32).write_bits_in_range(&eax::CACHE_LEVEL_BITRANGE, cache_level),
             ebx: 0,
             ecx: 0,
             edx: 0,
             padding: [0, 0, 0],
         };
 
-        assert!(update_cache_parameters_entry(&mut entry, &vm_spec).is_ok());
+        assert!(update_cache_parameters_entry(entry, &vm_spec).is_ok());
 
         assert!(
             entry
@@ -261,7 +261,7 @@ mod tests {
         let topoext_fn = get_topoext_fn();
 
         // check that it behaves correctly for TOPOEXT function
-        let mut cpuid = CpuId::new(1);
+        let mut cpuid = CpuId::new(1).unwrap();
         cpuid.as_mut_slice()[0].function = topoext_fn;
         assert!(use_host_cpuid_function(&mut cpuid, topoext_fn, true).is_ok());
         let entries = cpuid.as_mut_slice();
@@ -281,7 +281,7 @@ mod tests {
         let feature_info_fn = LEAF_NUM;
 
         // check that it behaves correctly for TOPOEXT function
-        let mut cpuid = CpuId::new(1);
+        let mut cpuid = CpuId::new(1).unwrap();
         cpuid.as_mut_slice()[0].function = feature_info_fn;
         assert!(use_host_cpuid_function(&mut cpuid, feature_info_fn, false).is_ok());
         let entries = cpuid.as_mut_slice();
@@ -298,9 +298,9 @@ mod tests {
     fn test_use_host_cpuid_function_err() {
         let topoext_fn = get_topoext_fn();
         // check that it returns Err when there are too many entriesentry.function == topoext_fn
-        let mut cpuid = CpuId::new(kvm_bindings::KVM_MAX_CPUID_ENTRIES);
+        let mut cpuid = CpuId::new(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap();
         match use_host_cpuid_function(&mut cpuid, topoext_fn, true) {
-            Err(Error::FamError(utils::fam::Error::SizeLimitExceeded)) => {}
+            Err(Error::Fam(utils::fam::Error::SizeLimitExceeded)) => {}
             _ => panic!("Wrong behavior"),
         }
     }

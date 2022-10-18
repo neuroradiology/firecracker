@@ -6,6 +6,8 @@
 mod connection;
 mod txbuf;
 
+use std::fmt;
+
 pub use connection::VsockConnection;
 
 pub mod defs {
@@ -33,10 +35,30 @@ pub enum Error {
     StreamWrite(std::io::Error),
 }
 
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::TxBufFull => write!(f, "Attempted to push data to a full TX buffer"),
+            Self::TxBufFlush(err) => write!(
+                f,
+                "An I/O error occurred, when attempting to flush the connection TX buffer: {}",
+                err
+            ),
+            Self::StreamWrite(err) => write!(
+                f,
+                "An I/O error occurred, when attempting to write data to the host-side stream: {}",
+                err
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
 type Result<T> = std::result::Result<T, Error>;
 
 /// A vsock connection state.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnState {
     /// The connection has been initiated by the host end, but is yet to be confirmed by the guest.
     LocalInit,
@@ -115,5 +137,29 @@ impl From<PendingRx> for PendingRxSet {
         Self {
             data: it.into_mask(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_display_error() {
+        assert_eq!(
+            format!("{}", Error::TxBufFull),
+            "Attempted to push data to a full TX buffer"
+        );
+
+        assert_eq!(
+            Error::TxBufFlush(std::io::Error::from(std::io::ErrorKind::Other)).to_string(),
+            "An I/O error occurred, when attempting to flush the connection TX buffer: other error"
+        );
+
+        assert_eq!(
+            Error::StreamWrite(std::io::Error::from(std::io::ErrorKind::Other)).to_string(),
+            "An I/O error occurred, when attempting to write data to the host-side stream: other \
+             error"
+        );
     }
 }

@@ -4,6 +4,7 @@
 //! Defines the structures needed for saving/restoring MmdsNetworkStack.
 
 use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex};
 
 use snapshot::Persist;
 use utils::net::mac::{MacAddr, MAC_ADDR_LEN};
@@ -11,9 +12,11 @@ use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 
 use super::ns::MmdsNetworkStack;
+use crate::Mmds;
 
 /// State of a MmdsNetworkStack.
-#[derive(Versionize)]
+#[derive(Clone, Versionize)]
+// NOTICE: Any changes to this structure require a snapshot version bump.
 pub struct MmdsNetworkStackState {
     mac_addr: [u8; MAC_ADDR_LEN],
     ipv4_addr: u32,
@@ -24,7 +27,7 @@ pub struct MmdsNetworkStackState {
 
 impl Persist<'_> for MmdsNetworkStack {
     type State = MmdsNetworkStackState;
-    type ConstructorArgs = ();
+    type ConstructorArgs = Arc<Mutex<Mmds>>;
     type Error = ();
 
     fn save(&self) -> Self::State {
@@ -41,7 +44,7 @@ impl Persist<'_> for MmdsNetworkStack {
     }
 
     fn restore(
-        _: Self::ConstructorArgs,
+        mmds: Self::ConstructorArgs,
         state: &Self::State,
     ) -> std::result::Result<Self, Self::Error> {
         Ok(MmdsNetworkStack::new(
@@ -50,6 +53,7 @@ impl Persist<'_> for MmdsNetworkStack {
             state.tcp_port,
             std::num::NonZeroUsize::new(state.max_connections).unwrap(),
             std::num::NonZeroUsize::new(state.max_pending_resets).unwrap(),
+            mmds,
         ))
     }
 }
@@ -60,7 +64,7 @@ mod tests {
 
     #[test]
     fn test_persistence() {
-        let ns = MmdsNetworkStack::new_with_defaults(None);
+        let ns = MmdsNetworkStack::new_with_defaults(None, Arc::new(Mutex::new(Mmds::default())));
 
         let mut mem = vec![0; 4096];
         let version_map = VersionMap::new();
@@ -70,7 +74,7 @@ mod tests {
             .unwrap();
 
         let restored_ns = MmdsNetworkStack::restore(
-            (),
+            Arc::new(Mutex::new(Mmds::default())),
             &MmdsNetworkStackState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap(),
         )
         .unwrap();

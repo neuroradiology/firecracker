@@ -15,10 +15,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let msg = match self {
             Error::AlreadyInitialized => "The component is already initialized.".to_string(),
-            Error::InitializationInProgress => {
-                "The component is initializing. Can't perform the requested action right now."
-                    .to_string()
-            }
+            Error::InitializationInProgress => "The component is initializing. Can't perform the \
+                                                requested action right now."
+                .to_string(),
         };
         f.write_str(&msg)
     }
@@ -52,14 +51,16 @@ impl Init {
     where
         F: FnOnce() -> bool,
     {
-        match self
-            .state
-            .compare_and_swap(Self::UNINITIALIZED, Self::INITIALIZING, Ordering::SeqCst)
-        {
-            Self::INITIALIZING => {
+        match self.state.compare_exchange(
+            Self::UNINITIALIZED,
+            Self::INITIALIZING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Err(Self::INITIALIZING) => {
                 return Err(Error::InitializationInProgress);
             }
-            Self::INITIALIZED => {
+            Err(Self::INITIALIZED) => {
                 return Err(Error::AlreadyInitialized);
             }
             _ => {}

@@ -3,25 +3,28 @@
 
 //! Defines the structures needed for saving/restoring Virtio primitives.
 
-use super::device::*;
-use super::queue::*;
-use crate::virtio::MmioTransport;
-use snapshot::Persist;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
-use vm_memory::Address;
-use vm_memory::{GuestAddress, GuestMemoryMmap};
-
 use std::num::Wrapping;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+
+use snapshot::Persist;
+use versionize::{VersionMap, Versionize, VersionizeResult};
+use versionize_derive::Versionize;
+use virtio_gen::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
+use vm_memory::address::Address;
+use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+use super::device::*;
+use super::queue::*;
+use crate::virtio::MmioTransport;
 
 #[derive(Debug)]
 pub enum Error {
     InvalidInput,
 }
 
-#[derive(Clone, Debug, PartialEq, Versionize)]
+#[derive(Clone, Debug, PartialEq, Eq, Versionize)]
+// NOTICE: Any changes to this structure require a snapshot version bump.
 pub struct QueueState {
     /// The maximal size in elements offered by the device
     max_size: u16,
@@ -43,25 +46,10 @@ pub struct QueueState {
 
     next_avail: Wrapping<u16>,
     next_used: Wrapping<u16>,
-}
 
-impl QueueState {
-    /// Does a sanity check against expected values.
-    pub fn sanity_check(&self, queue_max_size: u16) -> std::result::Result<(), Error> {
-        // Cannot use `q.is_valid()` because snapshot can happen at any time,
-        // including during device configuration/activation when fields are only
-        // partially configured.
-        // We can't even check if GuestAddresses are valid guest phys addresses because
-        // their configuration happens in two steps for the two u32 halves of the
-        // u64 address. This means a snapshot can capture them only partially configured.
-        //
-        // The best we can do is sanity check queue size and max size.
-        if self.max_size != queue_max_size || self.size > queue_max_size {
-            Err(Error::InvalidInput)
-        } else {
-            Ok(())
-        }
-    }
+    /// The number of added used buffers since last guest kick
+    #[version(start = 2)]
+    num_added: Wrapping<u16>,
 }
 
 impl Persist<'_> for Queue {
@@ -79,6 +67,7 @@ impl Persist<'_> for Queue {
             used_ring: self.used_ring.0,
             next_avail: self.next_avail,
             next_used: self.next_used,
+            num_added: self.num_added,
         }
     }
 
@@ -95,12 +84,15 @@ impl Persist<'_> for Queue {
             used_ring: GuestAddress::new(state.used_ring),
             next_avail: state.next_avail,
             next_used: state.next_used,
+            uses_notif_suppression: false,
+            num_added: state.num_added,
         })
     }
 }
 
 /// State of a VirtioDevice.
-#[derive(Debug, PartialEq, Versionize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Versionize)]
+// NOTICE: Any changes to this structure require a snapshot version bump.
 pub struct VirtioDeviceState {
     pub device_type: u32,
     pub avail_features: u64,
@@ -122,32 +114,59 @@ impl VirtioDeviceState {
         }
     }
 
-    /// Does a sanity check against expected values.
-    pub fn sanity_check(
+    /// Does sanity checking on the `self` state against expected values
+    /// and builds queues from state.
+    pub fn build_queues_checked(
         &self,
-        device_type: u32,
-        num_queues: usize,
-        queue_max_size: u16,
-    ) -> std::result::Result<(), Error> {
-        // Check:
+        mem: &GuestMemoryMmap,
+        expected_device_type: u32,
+        expected_num_queues: usize,
+        expected_queue_max_size: u16,
+    ) -> std::result::Result<Vec<Queue>, Error> {
+        // Sanity check:
         // - right device type,
         // - acked features is a subset of available ones,
         // - right number of queues,
-        if self.device_type != device_type
+        if self.device_type != expected_device_type
             || (self.acked_features & !self.avail_features) != 0
-            || self.queues.len() != num_queues
+            || self.queues.len() != expected_num_queues
         {
             return Err(Error::InvalidInput);
         }
-        // Queues are the expected size.
-        for q in self.queues.iter() {
-            q.sanity_check(queue_max_size)?;
+
+        let uses_notif_suppression = (self.acked_features & 1u64 << VIRTIO_RING_F_EVENT_IDX) != 0;
+        let queues: Vec<Queue> = self
+            .queues
+            .iter()
+            .map(|queue_state| {
+                // Safe to unwrap, `Queue::restore` has no error case.
+                let mut queue = Queue::restore((), queue_state).unwrap();
+                if uses_notif_suppression {
+                    queue.enable_notif_suppression();
+                }
+                queue
+            })
+            .collect();
+
+        for q in &queues {
+            // Sanity check queue size and queue max size.
+            if q.max_size != expected_queue_max_size || q.size > expected_queue_max_size {
+                return Err(Error::InvalidInput);
+            }
+            // Snapshot can happen at any time, including during device configuration/activation
+            // when fields are only partially configured.
+            //
+            // Only if the device was activated, check `q.is_valid()`.
+            if self.activated && !q.is_valid(mem) {
+                return Err(Error::InvalidInput);
+            }
         }
-        Ok(())
+        Ok(queues)
     }
 }
 
-#[derive(Debug, PartialEq, Versionize)]
+#[derive(Clone, Debug, PartialEq, Eq, Versionize)]
+// NOTICE: Any changes to this structure require a snapshot version bump.
 pub struct MmioTransportState {
     // The register where feature bits are stored.
     features_select: u32,
@@ -194,12 +213,14 @@ impl Persist<'_> for MmioTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::virtio::block::device::tests::default_mem;
-    use crate::virtio::mmio::tests::DummyDevice;
-    use crate::virtio::{Block, Net, Vsock, VsockUnixBackend};
-
     use utils::tempfile::TempFile;
+
+    use super::*;
+    use crate::virtio::block::device::FileEngineType;
+    use crate::virtio::block::test_utils::default_block_with_path;
+    use crate::virtio::mmio::tests::DummyDevice;
+    use crate::virtio::test_utils::default_mem;
+    use crate::virtio::{net, Block, Net, Vsock, VsockUnixBackend};
 
     const DEFAULT_QUEUE_MAX_SIZE: u16 = 256;
     impl Default for QueueState {
@@ -213,54 +234,68 @@ mod tests {
                 used_ring: 0,
                 next_avail: Wrapping(0),
                 next_used: Wrapping(0),
+                num_added: Wrapping(0),
             }
         }
-    }
-
-    impl Default for VirtioDeviceState {
-        fn default() -> VirtioDeviceState {
-            VirtioDeviceState {
-                device_type: 0,
-                avail_features: 0,
-                acked_features: 0,
-                queues: vec![],
-                interrupt_status: 0,
-                activated: false,
-            }
-        }
-    }
-
-    #[test]
-    fn test_queue_sanity_checks() {
-        let max_size = DEFAULT_QUEUE_MAX_SIZE;
-        let good_q = QueueState::default();
-        // Valid.
-        good_q.sanity_check(max_size).unwrap();
-
-        // Invalid max queue size.
-        let mut bad_q = QueueState::default();
-        bad_q.max_size = max_size + 1;
-        bad_q.sanity_check(max_size).unwrap_err();
-
-        // Invalid: size > max.
-        let mut bad_q = QueueState::default();
-        bad_q.size = max_size + 1;
-        bad_q.sanity_check(max_size).unwrap_err();
     }
 
     #[test]
     fn test_virtiodev_sanity_checks() {
         let max_size = DEFAULT_QUEUE_MAX_SIZE;
         let mut state = VirtioDeviceState::default();
+        let mem = default_mem();
         // Valid checks.
-        state.sanity_check(0, 0, max_size).unwrap();
+        state.build_queues_checked(&mem, 0, 0, max_size).unwrap();
         // Invalid dev-type.
-        state.sanity_check(1, 0, max_size).unwrap_err();
+        state
+            .build_queues_checked(&mem, 1, 0, max_size)
+            .unwrap_err();
         // Invalid num-queues.
-        state.sanity_check(0, 1, max_size).unwrap_err();
+        state
+            .build_queues_checked(&mem, 0, 1, max_size)
+            .unwrap_err();
         // Unavailable features acked.
         state.acked_features = 1;
-        state.sanity_check(0, 0, max_size).unwrap_err();
+        state
+            .build_queues_checked(&mem, 0, 0, max_size)
+            .unwrap_err();
+
+        // Validate queue sanity checks.
+        let mut state = VirtioDeviceState::default();
+        let good_q = QueueState::default();
+        state.queues = vec![good_q];
+        // Valid.
+        state
+            .build_queues_checked(&mem, 0, state.queues.len(), max_size)
+            .unwrap();
+
+        // Invalid max queue size.
+        let bad_q = QueueState {
+            max_size: max_size + 1,
+            ..Default::default()
+        };
+        state.queues = vec![bad_q];
+        state
+            .build_queues_checked(&mem, 0, state.queues.len(), max_size)
+            .unwrap_err();
+
+        // Invalid: size > max.
+        let bad_q = QueueState {
+            size: max_size + 1,
+            ..Default::default()
+        };
+        state.queues = vec![bad_q];
+        state
+            .build_queues_checked(&mem, 0, state.queues.len(), max_size)
+            .unwrap_err();
+
+        // activated && !q.is_valid()
+        let bad_q = QueueState::default();
+        state.queues = vec![bad_q];
+        state.activated = true;
+        state
+            .build_queues_checked(&mem, 0, state.queues.len(), max_size)
+            .unwrap_err();
     }
 
     #[test]
@@ -339,13 +374,15 @@ mod tests {
     }
 
     fn default_block() -> (MmioTransport, GuestMemoryMmap, Arc<Mutex<Block>>) {
-        use crate::virtio::block::device::tests::default_block_with_path;
         let mem = default_mem();
 
         // Create backing file.
         let f = TempFile::new().unwrap();
         f.as_file().set_len(0x1000).unwrap();
-        let block = default_block_with_path(f.as_path().to_str().unwrap().to_string());
+        let block = default_block_with_path(
+            f.as_path().to_str().unwrap().to_string(),
+            FileEngineType::default(),
+        );
         let block = Arc::new(Mutex::new(block));
         let mmio_transport = MmioTransport::new(mem.clone(), block.clone());
 
@@ -354,7 +391,7 @@ mod tests {
 
     fn default_net() -> (MmioTransport, GuestMemoryMmap, Arc<Mutex<Net>>) {
         let mem = default_mem();
-        let net = Arc::new(Mutex::new(Net::default_net()));
+        let net = Arc::new(Mutex::new(net::test_utils::default_net()));
         let mmio_transport = MmioTransport::new(mem.clone(), net.clone());
 
         (mmio_transport, mem, net)

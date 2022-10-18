@@ -2,49 +2,50 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::os::unix::io::AsRawFd;
 
+use event_manager::{EventOps, Events, MutEventSubscriber};
 use logger::{debug, error, warn};
-use polly::event_manager::{EventManager, Subscriber};
-use utils::epoll::{EpollEvent, EventSet};
+use utils::epoll::EventSet;
 
+use super::io::FileEngine;
 use crate::virtio::block::device::Block;
 use crate::virtio::VirtioDevice;
 
 impl Block {
-    fn process_activate_event(&self, event_manager: &mut EventManager) {
-        debug!("block: activate event");
-        if let Err(e) = self.activate_evt.read() {
-            error!("Failed to consume block activate event: {:?}", e);
+    fn register_runtime_events(&self, ops: &mut EventOps) {
+        if let Err(err) = ops.add(Events::new(&self.queue_evts[0], EventSet::IN)) {
+            error!("Failed to register queue event: {}", err);
         }
-        let activate_fd = self.activate_evt.as_raw_fd();
-        // The subscriber must exist as we previously registered activate_evt via
-        // `interest_list()`.
-        let self_subscriber = match event_manager.subscriber(activate_fd) {
-            Ok(subscriber) => subscriber,
-            Err(e) => {
-                error!("Failed to process block activate evt: {:?}", e);
-                return;
+        if let Err(err) = ops.add(Events::new(&self.rate_limiter, EventSet::IN)) {
+            error!("Failed to register ratelimiter event: {}", err);
+        }
+        if let FileEngine::Async(engine) = self.disk.file_engine() {
+            if let Err(err) = ops.add(Events::new(engine.completion_evt(), EventSet::IN)) {
+                error!("Failed to register IO engine completion event: {}", err);
             }
-        };
-
-        // Interest list changes when the device is activated.
-        let interest_list = self.interest_list();
-        for event in interest_list {
-            event_manager
-                .register(event.data() as i32, event, self_subscriber.clone())
-                .unwrap_or_else(|e| {
-                    error!("Failed to register block events: {:?}", e);
-                });
         }
+    }
 
-        event_manager.unregister(activate_fd).unwrap_or_else(|e| {
-            error!("Failed to unregister block activate evt: {:?}", e);
-        });
+    fn register_activate_event(&self, ops: &mut EventOps) {
+        if let Err(err) = ops.add(Events::new(&self.activate_evt, EventSet::IN)) {
+            error!("Failed to register activate event: {}", err);
+        }
+    }
+
+    fn process_activate_event(&self, ops: &mut EventOps) {
+        debug!("block: activate event");
+        if let Err(err) = self.activate_evt.read() {
+            error!("Failed to consume block activate event: {:?}", err);
+        }
+        self.register_runtime_events(ops);
+        if let Err(err) = ops.remove(Events::new(&self.activate_evt, EventSet::IN)) {
+            error!("Failed to un-register activate event: {}", err);
+        }
     }
 }
 
-impl Subscriber for Block {
+impl MutEventSubscriber for Block {
     // Handle an event for queue or rate limiter.
-    fn process(&mut self, event: &EpollEvent, evmgr: &mut EventManager) {
+    fn process(&mut self, event: Events, ops: &mut EventOps) {
         let source = event.fd();
         let event_set = event.event_set();
 
@@ -63,12 +64,17 @@ impl Subscriber for Block {
             let queue_evt = self.queue_evts[0].as_raw_fd();
             let rate_limiter_evt = self.rate_limiter.as_raw_fd();
             let activate_fd = self.activate_evt.as_raw_fd();
+            let maybe_completion_fd = match self.disk.file_engine() {
+                FileEngine::Async(engine) => Some(engine.completion_evt().as_raw_fd()),
+                FileEngine::Sync(_) => None,
+            };
 
             // Looks better than C style if/else if/else.
             match source {
                 _ if queue_evt == source => self.process_queue_event(),
                 _ if rate_limiter_evt == source => self.process_rate_limiter_event(),
-                _ if activate_fd == source => self.process_activate_event(evmgr),
+                _ if activate_fd == source => self.process_activate_event(ops),
+                _ if maybe_completion_fd == Some(source) => self.process_async_completion_event(),
                 _ => warn!("Block: Spurious event received: {:?}", source),
             }
         } else {
@@ -79,21 +85,15 @@ impl Subscriber for Block {
         }
     }
 
-    fn interest_list(&self) -> Vec<EpollEvent> {
+    fn init(&mut self, ops: &mut EventOps) {
         // This function can be called during different points in the device lifetime:
         //  - shortly after device creation,
         //  - on device activation (is-activated already true at this point),
         //  - on device restore from snapshot.
         if self.is_activated() {
-            vec![
-                EpollEvent::new(EventSet::IN, self.queue_evts[0].as_raw_fd() as u64),
-                EpollEvent::new(EventSet::IN, self.rate_limiter.as_raw_fd() as u64),
-            ]
+            self.register_runtime_events(ops);
         } else {
-            vec![EpollEvent::new(
-                EventSet::IN,
-                self.activate_evt.as_raw_fd() as u64,
-            )]
+            self.register_activate_event(ops);
         }
     }
 }
@@ -102,23 +102,29 @@ impl Subscriber for Block {
 pub mod tests {
     use std::sync::{Arc, Mutex};
 
-    use super::*;
-    use crate::virtio::block::device::tests::*;
-    use crate::virtio::queue::tests::*;
-    use virtio_gen::virtio_blk::*;
+    use event_manager::{EventManager, SubscriberOps};
+    use virtio_gen::virtio_blk::{VIRTIO_BLK_S_OK, VIRTIO_BLK_T_OUT};
     use vm_memory::{Bytes, GuestAddress};
+
+    use super::*;
+    use crate::virtio::block::device::FileEngineType;
+    use crate::virtio::block::test_utils::{
+        default_block, set_queue, simulate_async_completion_event,
+    };
+    use crate::virtio::queue::tests::*;
+    use crate::virtio::test_utils::{default_mem, initialize_virtqueue, VirtQueue};
 
     #[test]
     fn test_event_handler() {
         let mut event_manager = EventManager::new().unwrap();
-        let mut block = default_block();
+        let mut block = default_block(FileEngineType::default());
         let mem = default_mem();
         let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
-        block.set_queue(0, vq.create_queue());
+        set_queue(&mut block, 0, vq.create_queue());
         initialize_virtqueue(&vq);
 
         let block = Arc::new(Mutex::new(block));
-        event_manager.add_subscriber(block.clone()).unwrap();
+        let _id = event_manager.add_subscriber(block.clone());
 
         let request_type_addr = GuestAddress(vq.dtable[0].addr.get());
         let data_addr = GuestAddress(vq.dtable[1].addr.get());
@@ -128,9 +134,9 @@ pub mod tests {
         {
             mem.write_obj::<u32>(VIRTIO_BLK_T_OUT, request_type_addr)
                 .unwrap();
-            // Make data read only, 8 bytes in len, and set the actual value to be written.
+            // Make data read only, 512 bytes in len, and set the actual value to be written.
             vq.dtable[1].flags.set(VIRTQ_DESC_F_NEXT);
-            vq.dtable[1].len.set(8);
+            vq.dtable[1].len.set(512);
             mem.write_obj::<u64>(123_456_789, data_addr).unwrap();
 
             // Trigger the queue event.
@@ -142,23 +148,6 @@ pub mod tests {
         let ev_count = event_manager.run_with_timeout(50).unwrap();
         assert_eq!(ev_count, 0);
 
-        // Manually force a queue event and check it's ignored pre-activation.
-        {
-            let mut b = block.lock().unwrap();
-            let raw_q_evt = b.queue_evts[0].as_raw_fd() as u64;
-            // Artificially push event.
-            b.process(
-                &EpollEvent::new(EventSet::IN, raw_q_evt),
-                &mut event_manager,
-            );
-            // Validate there was no queue operation.
-            assert_eq!(
-                b.interrupt_evt().read().unwrap_err().kind(),
-                std::io::ErrorKind::WouldBlock
-            );
-            assert_eq!(vq.used.idx.get(), 0);
-        }
-
         // Now activate the device.
         block.lock().unwrap().activate(mem.clone()).unwrap();
         // Process the activate event.
@@ -169,12 +158,12 @@ pub mod tests {
         event_manager
             .run_with_timeout(100)
             .expect("Metrics event timeout or error.");
-        // Validate the queue operation finished successfully.
-        assert_eq!(block.lock().unwrap().interrupt_evt().read().unwrap(), 1);
+        // Complete async IO ops if needed
+        simulate_async_completion_event(&mut block.lock().unwrap(), true);
 
         assert_eq!(vq.used.idx.get(), 1);
         assert_eq!(vq.used.ring[0].get().id, 0);
-        assert_eq!(vq.used.ring[0].get().len, 0);
+        assert_eq!(vq.used.ring[0].get().len, 1);
         assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
     }
 }

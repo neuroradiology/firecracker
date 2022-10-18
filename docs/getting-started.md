@@ -12,22 +12,21 @@
 
 ## Prerequisites
 
-If you need an opinionated way of running Firecracker, create an `i3.metal`
+If you need an opinionated way of running Firecracker, launch an `i3.metal`
 instance using Ubuntu 18.04 on EC2. Firecracker uses
 [KVM](https://www.linux-kvm.org) and needs read/write access that can be
 granted as shown below:
 
-```
+```console
 sudo setfacl -m u:${USER}:rw /dev/kvm
 ```
 
 The generic requirements are explained below:
 
-- **Linux 4.14+**
+- **Linux**
 
   Firecracker currently supports physical Linux **x86_64** and **aarch64**
-  hosts, running kernel version 4.14 or later. However, the **aarch64** support
-  is not feature complete (alpha stage).
+  hosts. The currently supported kernel versions can be found [here](kernel-policy.md).
 
 - **KVM**
 
@@ -43,7 +42,7 @@ the repository and execute `tools/devtool checkenv`.
 ## Getting the Firecracker Binary
 
 Firecracker is linked statically against
-[musl](https://www.musl-libc.org/), having no library dependencies. You can
+[musl](https://musl.libc.org/), having no library dependencies. You can
 just download the latest binary from our
 [release page](https://github.com/firecracker-microvm/firecracker/releases),
 and run it on your x86_64 or aarch64 Linux machine.
@@ -51,23 +50,17 @@ and run it on your x86_64 or aarch64 Linux machine.
 On the EC2 instance, this binary can be downloaded as:
 
 ```wrap
-latest=$(basename $(curl -fsSLI -o /dev/null -w  %{url_effective} https://github.com/firecracker-microvm/firecracker/releases/latest))
-```
-
-```wrap
-curl -LOJ https://github.com/firecracker-microvm/firecracker/releases/download/${latest}/firecracker-${latest}-$(uname -m)
+release_url="https://github.com/firecracker-microvm/firecracker/releases"
+latest=$(basename $(curl -fsSLI -o /dev/null -w  %{url_effective} ${release_url}/latest))
+arch=`uname -m`
+curl -L ${release_url}/download/${latest}/firecracker-${latest}-${arch}.tgz \
+| tar -xz
 ```
 
 Rename the binary to "firecracker":
 
-```
-mv firecracker-${latest}-$(uname -m) firecracker
-```
-
-Make the binary executable:
-
-```
-chmod +x firecracker
+```console
+mv release-${latest}-$(uname -m)/firecracker-${latest}-$(uname -m) firecracker
 ```
 
 If, instead, you'd like to build Firecracker yourself, you should check out
@@ -90,11 +83,11 @@ Next, you will need an uncompressed Linux kernel binary, and an ext4
 file system image (to use as rootfs).
 
 1. To run an `x86_64` guest you can download such resources from:
-    [kernel](https://s3.amazonaws.com/spec.ccfc.min/img/hello/kernel/hello-vmlinux.bin)
-    and [rootfs](https://s3.amazonaws.com/spec.ccfc.min/img/hello/fsfiles/hello-rootfs.ext4).
+    [kernel](https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin)
+    and [rootfs](https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/rootfs/bionic.rootfs.ext4).
 1. To run an `aarch64` guest, download them from:
-    [kernel](https://s3.amazonaws.com/spec.ccfc.min/img/aarch64/ubuntu_with_ssh/kernel/vmlinux.bin)
-    and [rootfs](https://s3.amazonaws.com/spec.ccfc.min/img/aarch64/ubuntu_with_ssh/fsfiles/xenial.rootfs.ext4).
+    [kernel](https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/aarch64/kernels/vmlinux.bin)
+    and [rootfs](https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/aarch64/rootfs/bionic.rootfs.ext4).
 
 Now, let's open up two shell prompts: one to run Firecracker, and another one
 to control it (by writing to the API socket). For the purpose of this guide,
@@ -123,14 +116,14 @@ In your **second shell** prompt:
   arch=`uname -m`
   dest_kernel="hello-vmlinux.bin"
   dest_rootfs="hello-rootfs.ext4"
-  image_bucket_url="https://s3.amazonaws.com/spec.ccfc.min/img"
+  image_bucket_url="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/$arch"
 
   if [ ${arch} = "x86_64" ]; then
-      kernel="${image_bucket_url}/hello/kernel/hello-vmlinux.bin"
-      rootfs="${image_bucket_url}/hello/fsfiles/hello-rootfs.ext4"
+      kernel="${image_bucket_url}/kernels/vmlinux.bin"
+      rootfs="${image_bucket_url}/rootfs/bionic.rootfs.ext4"
   elif [ ${arch} = "aarch64" ]; then
-      kernel="${image_bucket_url}/aarch64/ubuntu_with_ssh/kernel/vmlinux.bin"
-      rootfs="${image_bucket_url}/aarch64/ubuntu_with_ssh/fsfiles/xenial.rootfs.ext4"
+      kernel="${image_bucket_url}/kernels/vmlinux.bin"
+      rootfs="${image_bucket_url}/rootfs/bionic.rootfs.ext4"
   else
       echo "Cannot run firecracker on $arch architecture!"
       exit 1
@@ -223,8 +216,7 @@ curl --unix-socket /tmp/firecracker.socket -i  \
   -H 'Content-Type: application/json'      \
   -d '{
       "vcpu_count": 2,
-      "mem_size_mib": 1024,
-      "ht_enabled": false
+      "mem_size_mib": 1024
   }'
 ```
 
@@ -268,7 +260,7 @@ Get a copy of the Firecracker sources by cloning our GitHub repo:
 git clone https://github.com/firecracker-microvm/firecracker
 ```
 
-All development happens on the master branch and we use git tags to mark
+All development happens on the main branch and we use git tags to mark
 releases. If you are interested in a specific release (e.g. v0.10.1), you can
 check it out with:
 
@@ -280,14 +272,32 @@ git checkout tags/v0.10.1
 
 Within the Firecracker repository root directory:
 
-1. with the __default__ musl target: ```tools/devtool build```
-1. (__Experimental only__) using the gnu target: 
-```tools/devtool build -l gnu```
+1. With the __default__ musl target:
+
+   ```tools/devtool build```
+
+1. (__Experimental only__) using the gnu target:
+
+   ```tools/devtool build -l gnu```
 
 This will build and place the two Firecracker binaries at:
 
 - `build/cargo_target/${toolchain}/debug/firecracker` and
 - `build/cargo_target/${toolchain}/debug/jailer`.
+
+If you would like to test a new feature and work with
+dependencies on libraries located in private git repos, you
+can use the `--ssh-keys` flag to specify the paths to your
+public and private SSH keys on the host. Both of them are
+required for git authentication when fetching the repositories.
+
+```bash
+tools/devtool build --ssh-keys ~/.ssh/id_rsa.pub ~/.ssh/id_rsa
+```
+
+Please note that only a single set of credentials is supported.
+`devtool` cannot fetch multiple private repos which rely on
+different credentials.
 
 The default build profile is `debug`. If you want to build
 the release binaries (optimized and stripped of debug info),

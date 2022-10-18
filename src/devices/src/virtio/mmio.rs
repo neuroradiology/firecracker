@@ -12,17 +12,21 @@ use logger::warn;
 use utils::byte_order;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
-use super::device_status;
-use super::*;
+use super::{device_status, *};
 use crate::bus::BusDevice;
 
-//TODO crosvm uses 0 here, but IIRC virtio specified some other vendor id that should be used
+// TODO crosvm uses 0 here, but IIRC virtio specified some other vendor id that should be used
 const VENDOR_ID: u32 = 0;
 
-//required by the virtio mmio device register layout at offset 0 from base
+/// Interrupt flags (re: interrupt status & acknowledge registers).
+/// See linux/virtio_mmio.h.
+pub const VIRTIO_MMIO_INT_VRING: u32 = 0x01;
+pub const VIRTIO_MMIO_INT_CONFIG: u32 = 0x02;
+
+// required by the virtio mmio device register layout at offset 0 from base
 const MMIO_MAGIC_VALUE: u32 = 0x7472_6976;
 
-//current version specified by the mmio standard (legacy devices used 1 here)
+// current version specified by the mmio standard (legacy devices used 1 here)
 const MMIO_VERSION: u32 = 2;
 
 /// Implements the
@@ -319,25 +323,15 @@ impl BusDevice for MmioTransport {
             }
         }
     }
-
-    fn interrupt(&self, irq_mask: u32) -> std::io::Result<()> {
-        self.interrupt_status
-            .fetch_or(irq_mask as usize, Ordering::SeqCst);
-        // interrupt_evt() is safe to unwrap because the inner interrupt_evt is initialized in the
-        // constructor.
-        // write() is safe to unwrap because the inner syscall is tailored to be safe as well.
-        self.locked_device().interrupt_evt().write(1).unwrap();
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use utils::byte_order::{read_le_u32, write_le_u32};
-
-    use super::*;
     use utils::eventfd::EventFd;
     use vm_memory::GuestMemoryMmap;
+
+    use super::*;
 
     pub(crate) struct DummyDevice {
         acked_features: u64,
@@ -437,7 +431,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_new() {
-        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m =
+            vm_memory::test_utils::create_anon_guest_memory(&[(GuestAddress(0), 0x1000)], false)
+                .unwrap();
         let mut dummy = DummyDevice::new();
         // Validate reset is no-op.
         assert!(dummy.reset().is_none());
@@ -469,7 +465,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_bus_device_read() {
-        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m =
+            vm_memory::test_utils::create_anon_guest_memory(&[(GuestAddress(0), 0x1000)], false)
+                .unwrap();
         let mut d = MmioTransport::new(m, Arc::new(Mutex::new(DummyDevice::new())));
 
         let mut buf = vec![0xff, 0, 0xfe, 0];
@@ -547,7 +545,9 @@ pub(crate) mod tests {
     #[test]
     #[allow(clippy::cognitive_complexity)]
     fn test_bus_device_write() {
-        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m =
+            vm_memory::test_utils::create_anon_guest_memory(&[(GuestAddress(0), 0x1000)], false)
+                .unwrap();
         let dummy_dev = Arc::new(Mutex::new(DummyDevice::new()));
         let mut d = MmioTransport::new(m, dummy_dev.clone());
         let mut buf = vec![0; 5];
@@ -570,7 +570,8 @@ pub(crate) mod tests {
         d.write(0x20, &buf[..]);
         assert_eq!(d.locked_device().acked_features(), 0x0);
 
-        // Write to device specific configuration space should be ignored before setting device_status::DRIVER
+        // Write to device specific configuration space should be ignored before setting
+        // device_status::DRIVER
         let buf1 = vec![1; 0xeff];
         for i in (0..0xeff).rev() {
             let mut buf2 = vec![0; 0xeff];
@@ -705,7 +706,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_bus_device_activate() {
-        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m =
+            vm_memory::test_utils::create_anon_guest_memory(&[(GuestAddress(0), 0x1000)], false)
+                .unwrap();
         let mut d = MmioTransport::new(m, Arc::new(Mutex::new(DummyDevice::new())));
 
         assert!(!d.are_queues_valid());
@@ -823,7 +826,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_bus_device_reset() {
-        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m =
+            vm_memory::test_utils::create_anon_guest_memory(&[(GuestAddress(0), 0x1000)], false)
+                .unwrap();
         let mut d = MmioTransport::new(m, Arc::new(Mutex::new(DummyDevice::new())));
         let mut buf = vec![0; 4];
 

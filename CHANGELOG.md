@@ -4,7 +4,326 @@
 
 ### Added
 
+- Add a new CPU template called `T2S`. This exposes the same CPUID as `T2`
+  to the Guest and also overwrites the `ARCH_CAPABILITIES` MSR to expose a
+  reduced set of capabilities. With regards to hardware vulnerabilities
+  and mitigations, the Guest vCPU will apear to look like a Skylake CPU,
+  making it safe to snapshot uVMs running on a newer host CPU (Cascade Lake)
+  and restore on a host that has a Skylake CPU.
+
+- Added a new CLI option `--metrics-path PATH`. It accepts a file parameter
+  where metrics will be sent to.
+- A MAC address is generated if one is not explicitly specified while adding
+  network interfaces. This address can be obtained as part of the GET
+  `/vm/config`.
+
+### Changed
+
+- Changed the jailer option `--exec-file` to fail if the filename does not
+  contain the string `firecracker` to prevent from running non-firecracker
+  binaries.
+
+### Fixed
+
+- Make the `T2` template more robust by explicitly disabling additional
+  CPUID flags that should be off but were missed initially or that were
+  not available in the spec when the template was created.
+- When MAC address was left unspecified, GET `/vm/config` would report the
+  interface MAC address incorrectly as `null`, and post snapshot restore as
+  `00:00:00:00:00:00`. It now correctly reports the code generated MAC address
+  when queried in both cases.
+- Fixed a self-DoS scenario in the virtio-queue code by reporting and
+  terminating execution when the number of available descriptors reported
+  by the driver is higher than the queue size.
+
+## [1.1.0]
+
+### Added
+
+- The API `PATCH` methods for `machine-config` can now be used to reset
+  the `cpu_template` to `"None"`. Until this change there was no way to
+  reset the `cpu_template` once it was set.
+- Added a `rebase-snap` tool for rebasing a diff snapshot over a base
+  snapshot.
+- Mmds version is persisted across snapshot-restore. Snapshot compatibility is
+  preserved bidirectionally, to and from a Firecracker version that does not
+  support persisting the Mmds version. In such cases, the default V1 option is
+  used.
+- Added `--mmds-size-limit` for limiting the mmds data store size instead of
+  piggy-backing on `--http-api-max-payload-size`. If left unconfigured it
+  defaults to the value of `--http-api-max-payload-size`, to provide backwards
+  compatibility.
+- Added optional `mem_backend` body field in `PUT` requests on `/snapshot/load`.
+  This new parameter is an object that defines the configuration of the backend
+  responsible for handling memory loading during snapshot restore. The
+  `mem_backend` parameter contains `backend_type` and `backend_path` required
+  fields. `backend_type` is an enum that can take either `File` or `Uffd` as
+  value. Interpretation of `backend_path` field depends on the value of
+  `backend_type`. If `File`, then the user must provide the path to file that
+  contains the guest memory to be loaded. Otherwise, if `backend_type` is `Uffd`,
+  then `backend_path` is the path to a unix domain socket where a custom page
+  fault handler process is listening and expecting a UFFD to be sent by
+  Firecracker. The UFFD is used to handle the guest memory page faults in the
+  separate process.
+- Added logging for the snapshot/restore and async block device IO engine
+  features to indicate they are in development preview.
+
+### Changed
+
+- The API `PATCH` method for `/machine-config` can be now used to change
+  `track_dirty_pages` on aarch64.
+- MmdsV2 is now Generally Available.
+- MmdsV1 is now deprecated and will be removed in Firecracker v2.0.0.
+  Use MmdsV2 instead.
+- Deprecated `mem_file_path` body field in `PUT` on `/snapshot/load` request.
+
+### Fixed
+
+- Fixed inconsistency that allowed the start of a microVM from a JSON file
+  without specifying the `vcpu_count` and `mem_size_mib` parameters for
+  `machine-config` although they are mandatory when configuring via the API.
+  Now these fields are mandatory when specifying `machine-config` in the JSON
+  file and when using the `PUT` request on `/machine-config`.
+- Fixed inconsistency that allowed a user to specify the `cpu_template`
+  parameter and set `smt` to `True` in `machine-config` when starting from a
+  JSON file on aarch64 even though they are not permitted when using `PUT` or
+  `PATCH` in the API. Now Firecracker will return an error on aarch64 if `smt`
+  is set to `True` or if `cpu_template` is specified.
+- Fixed inconsistent behaviour of the `PUT` method for `/machine-config` that
+  would reset the `track_dirty_pages` parameter to `false` if it was not
+  specified in the JSON body of the request, but left the `cpu_template`
+  parameter intact if it was not present in the request. Now a `PUT` request
+  for `/machine-config` will reset all optional parameters (`smt`,
+  `cpu_template`, `track_dirty_pages`) to their default values if they are
+  not specified in the `PUT` request.
+- Fixed incosistency in the swagger definition with the current state of the
+  `/vm/config` endpoint.
+
+## [1.0.0]
+
+### Added
+
+- Added jailer option `--parent-cgroup <relative_path>` to allow the placement
+  of microvm cgroups in custom cgroup nested hierarchies. The default value is
+  `<exec-file>` which is backwards compatible to the behavior before this
+  change.
+- Added jailer option `--cgroup-version <1|2>` to support running the jailer
+  on systems that have cgroup-v2. Default value is `1` which means that if
+  `--cgroup-version` is not specified, the jailer will try to create cgroups
+  on cgroup-v1 hierarchies only.
+- Added `--http-api-max-payload-size` parameter to configure the maximum payload
+  size for PUT and PATCH requests.
+- Limit MMDS data store size to `--http-api-max-payload-size`.
+- Cleanup all environment variables in Jailer.
+- Added metrics for accesses to deprecated HTTP and command line API endpoints.
+- Added permanent HTTP endpoint for `GET` on `/version` for getting the
+  Firecracker version.
+- Added `--metadata` parameter to enable MMDS content to be supplied from a file
+  allowing the MMDS to be used when using `--no-api` to disable the API server.
+- Checksum file for the release assets.
+- Added support for custom headers to MMDS requests. Accepted headers are:
+  `X-metadata-token`, which accepts a string value that provides a session
+  token for MMDS requests; and `X-metadata-token-ttl-seconds`, which
+  specifies the lifetime of the session token in seconds.
+- Support and validation for host and guest kernel 5.10.
+- A [kernel support policy](docs/kernel-policy.md).
+- Added `io_engine` to the pre-boot block device configuration.
+  Possible values: `Sync` (the default option) or `Async` (only available for
+  kernels newer than 5.10.51). The `Async` variant introduces a block device
+  engine that uses io_uring for executing requests asynchronously, which is in
+  **developer preview** (NOT for production use).
+  See `docs/api_requests/block-io-engine.md`.
+- Added `block.io_engine_throttled_events` metric for measuring the number of
+  virtio events throttled because of the IO engine.
+- New optional `version` field to PUT requests towards `/mmds/config` to
+  configure MMDS version. Accepted values are `V1` and `V2` and default is
+  `V1`. MMDS `V2` is **developer preview only** (NOT for production use) and
+  it does not currently work after snapshot load.
+- Mandatory `network_interfaces` field to PUT requests towards
+  `/mmds/config` which contains a list of network interface IDs capable of
+  forwarding packets to MMDS.
+
+### Changed
+
+- Removed the `--node` jailer parameter.
+- Deprecated `vsock_id` body field in `PUT`s on `/vsock`.
+- Removed the deprecated the `--seccomp-level parameter`.
+- `GET` requests to MMDS require a session token to be provided through
+  `X-metadata-token` header when using V2.
+- Allow `PUT` requests to MMDS in order to generate a session token
+  to be used for future `GET` requests when version 2 is used.
+- Remove `allow_mmds_requests` field from the request body that attaches network
+  interfaces. Specifying interfaces that allow forwarding requests to MMDS is done
+  by adding the network interface's ID to the `network_interfaces` field of PUT
+  `/mmds/config` request's body.
+- Renamed `/machine-config` `ht_enabled` to `smt`.
+- `smt` field is now optional on PUT `/machine-config`, defaulting to
+  `false`.
+- Configuring `smt: true` on aarch64 via the API is forbidden.
+
+### Fixed
+
+- GET `/vm/config` was returning a default config object after restoring from a
+  snapshot. It now correctly returns the config of the original microVM, except
+  for boot_config and the cpu_template and smt fields of the machine config,
+  which are currently lost.
+- Fixed incorrect propagation of init parameters in kernel commandline.
+  Related to:
+  [#2709](https://github.com/firecracker-microvm/firecracker/issues/2709).
+- Adapt T2 and C3 CPU templates for kernel 5.10. Firecracker was not previously
+  masking some CPU features of the host or emulated by KVM, introduced in more
+  recent kernels: `umip`, `vmx`, `avx512_vnni`.
+- Fix jailer's cgroup implementation to accept properties that contain multiple
+  dots.
+
+## [0.25.0]
+
+### Added
+
+- Added devtool build `--ssh-keys` flag to support fetching from private
+  git repositories.
+- Added option to configure block device flush.
+- Added `--new-pid-ns` flag to the Jailer in order to spawn the Firecracker
+  process in a new PID namespace.
+- Added API metrics for `GET`, `PUT` and `PATCH` requests on `/mmds` endpoint.
+- Added `--describe-snapshot` flag to Firecracker to fetch the data format
+  version of a snapshot state file provided as argument.
+- Added `--no-seccomp` parameter for disabling the default seccomp filters.
+- Added `--seccomp-filter` parameter for supplying user-provided, custom filters.
+- Added the `seccompiler-bin` binary that is used to compile JSON seccomp filters
+  into serialized BPF for Firecracker consumption.
+- Snapshotting support for GICv2 enabled guests.
+- Added `devtool install` to deploy built binaries in `/usr/local/bin` or a
+  given path.
+- Added code logic to send `VIRTIO_VSOCK_EVENT_TRANSPORT_RESET` on snapshot
+  creation, when the Vsock device is active. The event will close active
+  connections on the guest.
+- Added `GET` request on `/vm/config` that provides full microVM configuration
+  as a JSON HTTP response.
+- Added `--resource-limit` flag to jailer to limit resources such as: number of
+  file descriptors allowed at a time (with a default value of 2048) and maximum
+  size of files created by the process.
+
+### Changed
+
+- Changed Docker images repository from DockerHub to Amazon ECR.
+- Fixed off-by-one error in virtio-block descriptor address validation.
+- Changed the `PATCH` request on `/balloon/statistics` to schedule the first
+  statistics update immediately after processing the request.
+- Deprecated the `--seccomp-level parameter`. It will be removed  in a future
+  release. Using it logs a runtime warning.
+- Experimental gnu libc builds use empty default seccomp filters, allowing all
+  system calls.
+
+### Fixed
+
+- Fixed non-compliant check for the RTC device ensuring a fixed
+  4-sized data buffer.
+- Unnecessary interrupt assertion was removed from the RTC.
+  However, a dummy interrupt is still allocated for snapshot
+  compatibility reasons.
+- Fixed the SIGPIPE signal handler so Firecracker no longer exits. The signal
+  is still recorded in metrics and logs.
+- Fixed ballooning API definitions by renaming all fields which mentioned "MB"
+  to use "MiB" instead.
+- Snapshot related host files (vm-state, memory, block backing files) are now
+  flushed to their backing mediums as part of the CreateSnapshot operation.
+- Fixed the SSBD mitigation not being enabled on `aarch64` with the provided
+  `prod-host-setup.md`.
+- Fixed the balloon statistics not working after a snapshot restore event.
+- The `utc_timestamp_ms` now reports the timestamp in ms from the UTC UNIX
+  Epoch, as the name suggests. It was previously using a monotonic clock with
+  an undefined starting point.
+
+## [0.24.0]
+
+### Added
+
+- Added optional `resume_vm` field to `/snapshot/load` API call.
+- Added support for block rate limiter PATCH.
+- Added devtool test `-c|--cpuset-cpus` flag for cpus confinement when tests
+  run.
+- Added devtool test `-m|--cpuset-mems` flag for memory confinement when tests
+  run.
+- Added the virtio traditional memory ballooning device.
+- Added a mechanism to handle vCPU/VMM errors that result in process termination.
+- Added incremental guest memory snapshot support.
+- Added aarch64 snapshot support.
+
+### Changed
+
+- Change the information provided in `DescribeInstance` command to provide microVM
+  state information (Not started/Running/Paused) instead of whether it's
+  started or not.
+- Removed the jailer `--extra-args` parameter. It was a noop, having been
+  replaced by the `--` separator for extra arguments.
+- Changed the output of the `--version` command line parameter to include a list
+  of supported snapshot data format versions for the firecracker binary.
+- Increased the maximum number of virtio devices from 11 to 19.
+- Added a new check that prevents creating v0.23 snapshots when more than 11
+  devices are attached.
+- If the stdout buffer is full and non-blocking, the serial writes no longer block.
+  Any new bytes will be lost, until the buffer is freed. The device also logs these
+  errors and increments the `uart.error_count` metric for each lost byte.
+
+### Fixed
+
+- Fixed inconsistency in YAML file InstanceInfo definition
+
+## [0.23.0]
+
+### Added
+
 - Added metric for throttled block device events.
+- Added metrics for counting rate limiter throttling events.
+- Added metric for counting MAC address updates.
+- Added metrics for counting TAP read and write errors.
+- Added metrics for counting RX and TX partial writes.
+- Added metrics that measure the duration of pausing and resuming the microVM,
+  from the VMM perspective.
+- Added metric for measuring the duration of the last full/diff snapshot created,
+  from the VMM perspective.
+- Added metric for measuring the duration of loading a snapshot, from the VMM
+  perspective.
+- Added metrics that measure the duration of pausing and resuming the microVM,
+  from the API (user) perspective.
+- Added metric for measuring the duration of the last full/diff snapshot created,
+  from the API (user) perspective.
+- Added metric for measuring the duration of loading a snapshot, from the API
+  (user) perspective.
+- Added `track_dirty_pages` field to `machine-config`. If enabled, Firecracker
+  can create incremental guest memory snapshots by saving the dirty guest pages
+  in a sparse file.
+- Added a new API call, `PATCH /vm`, for changing the microVM state (to
+  `Paused` or `Resumed`).
+- Added a new API call, `PUT /snapshot/create`, for creating a full or diff snapshot.
+- Added a new API call, `PUT /snapshot/load`, for loading a snapshot.
+- Added new jailer command line argument `--cgroup` which allow the user to
+  specify the cgroups that are going to be set by the Jailer.
+- Added full support for AMD CPUs (General Availability). More details
+  [here](README.md#supported-platforms).
+
+### Fixed
+
+- Boot time on AMD achieves the desired performance (i.e under 150ms).
+
+### Changed
+
+- The logger `level` field is now case-insensitive.
+- Disabled boot timer device after restoring a snapshot.
+- Enabled boot timer device only when specifically requested, by using the
+  `--boot-timer` dedicated cmdline parameter.
+- firecracker and jailer `--version` now gets updated on each devtool
+  build to the output of `git describe --dirty`, if the git repo is available.
+- MicroVM process is only attached to the cgroups defined by using `--cgroups`
+  or the ones defined indirectly by using `--node`.
+- Changed `devtool build` to build jailer binary for `musl` only targets. Building
+  jailer binary for `non-musl` targets have been removed.
+
+## [0.22.0]
+
+### Added
+
 - Added a new API call, `PUT /metrics`, for configuring the metrics system.
 - Added `app_name` field in InstanceInfo struct for storing the application
   name.
@@ -17,34 +336,11 @@
   `MMDS` with a custom valid link-local IPv4 address.
 - Added experimental JSON response format support for MMDS guest applications
   requests.
-- Added `track_dirty_pages` field to `machine-config`. If enabled, Firecracker
-  can create incremental guest memory snapshots by saving the dirty guest pages
-  in a sparse file.
-- Added a new API call, `PATCH /vm`, for changing the microVM state (to
-  `Paused` or `Resumed`).
-- Added a new API call, `PUT /snapshot/create`, for creating a full snapshot.
-- Added a new API call, `PUT /snapshot/load`, for loading a snapshot.
 - Added metrics for the vsock device.
 - Added `devtool strip` command which removes debug symbols from the release
   binaries.
 - Added the `tx_malformed_frames` metric for the virtio net device, emitted
   when a TX frame missing the VNET header is encountered.
-- Added metrics for counting rate limiter throttling events.
-- Added metric for counting MAC address updates.
-- Added metrics for counting TAP read and write errors.
-- Added metrics for counting RX and TX partial writes.
-- Added metrics that measure the duration of pausing and resuming the microVM,
-  from the VMM perspective.
-- Added metric for measuring the duration of the last full snapshot created,
-  from the VMM perspective.
-- Added metric for measuring the duration of loading a snapshot, from the VMM
-  perspective.
-- Added metrics that measure the duration of pausing and resuming the microVM,
-  from the API (user) perspective.
-- Added metric for measuring the duration of the last full snapshot created,
-  from the API (user) perspective.
-- Added metric for measuring the duration of loading a snapshot, from the API
-  (user) perspective.
 
 ### Fixed
 
@@ -52,9 +348,14 @@
 - Return `405 Method Not Allowed` MMDS response for non HTTP `GET` MMDS
   requests originating from guest.
 - Fixed folder permissions in the jail (#1802).
-- Boot time on AMD achieves the desired performance (i.e under 150ms).
 - Any number of whitespace characters are accepted after ":" when parsing HTTP
   headers.
+- Potential panic condition caused by the net device expecting to find a VNET
+  header in every frame.
+- Potential crash scenario caused by "Content-Length" HTTP header field
+  accepting negative values.
+- Fixed #1754 - net: traffic blocks when running ingress UDP performance tests
+  with very large buffers.
 
 ### Changed
 
@@ -80,13 +381,6 @@
   `403 BadRequest`.
 - Segregated MMDS documentation in MMDS design documentation and MMDS user
   guide documentation.
-- The logger `level` field is now case-insensitive.
-- Disabled boot timer device after restoring a snapshot.
-- Enabled boot timer device only when specifically requested, by using the
-  `--boot-timer` dedicated cmdline parameter.
-- `firecracker/jailer --version` now gets updated on each devtool
-  build to the output of `git describe --dirty`, if the git repo is available.
-
 
 ## [0.21.0]
 
@@ -289,7 +583,7 @@
 ### Fixed
 
 - A `madvise` call issued by the `musl` allocator was added to the seccomp
-  whitelist to prevent Firecracker from terminating abruptly when allocating
+  allow list to prevent Firecracker from terminating abruptly when allocating
   memory in certain conditions.
 
 ## [0.15.0]
@@ -331,8 +625,8 @@
 
 - Log the app version when the `Logger` is initialized.
 - Pretty print panic information.
-- Firecracker terminates with exit code 148 when a non-whitelisted syscall
-  is intercepted.
+- Firecracker terminates with exit code 148 when a syscall which is not
+  present in the allow list is intercepted.
 
 ### Fixed
 

@@ -21,11 +21,10 @@
 //! The contract is that the user shall also call the `event_handler()` method on
 //! receipt of such an event.
 //!
-//! The token buckets are replenished every time a `consume()` is called, before
-//! actually trying to consume the requested amount of tokens. The amount of tokens
-//! replenished is automatically calculated to respect the `complete_refill_time`
-//! configuration parameter provided by the user. The token buckets will never
-//! replenish above their respective `size`.
+//! The token buckets are replenished when a called `consume()` doesn't find enough
+//! tokens in the bucket. The amount of tokens replenished is automatically calculated
+//! to respect the `complete_refill_time` configuration parameter provided by the user.
+//! The token buckets will never replenish above their respective `size`.
 //!
 //! Each token bucket can start off with a `one_time_burst` initial extra capacity
 //! on top of their `size`. This initial extra credit does not replenish and
@@ -43,10 +42,11 @@
 //! It is meant to be used in an external event loop and thus implements the `AsRawFd`
 //! trait and provides an *event-handler* as part of its API. This *event-handler*
 //! needs to be called by the user on every event on the rate limiter's `AsRawFd` FD.
-use logger::error;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 use std::{fmt, io};
+
+use logger::error;
 use timerfd::{ClockId, SetTimeFlags, TimerFd, TimerState};
 
 pub mod persist;
@@ -90,17 +90,22 @@ pub enum BucketReduction {
 
 /// TokenBucket provides a lower level interface to rate limiting with a
 /// configurable capacity, refill-rate and initial burst.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenBucket {
     // Bucket defining traits.
     size: u64,
-    // Initial burst size (number of free initial tokens, that can be consumed at no cost)
-    one_time_burst: u64,
+    // Initial burst size.
+    initial_one_time_burst: u64,
     // Complete refill time in milliseconds.
     refill_time: u64,
 
     // Internal state descriptors.
+
+    // Number of free initial tokens, that can be consumed at no cost.
+    one_time_burst: u64,
+    // Current token budget.
     budget: u64,
+    // Last time this token bucket saw activity.
     last_update: Instant,
 
     // Fields used for pre-processing optimizations.
@@ -131,12 +136,14 @@ impl TokenBucket {
         let common_factor = gcd(size, complete_refill_time_ns);
         // The division will be exact since `common_factor` is a factor of `size`.
         let processed_capacity: u64 = size / common_factor;
-        // The division will be exact since `common_factor` is a factor of `complete_refill_time_ns`.
+        // The division will be exact since `common_factor` is a factor of
+        // `complete_refill_time_ns`.
         let processed_refill_time: u64 = complete_refill_time_ns / common_factor;
 
         Some(TokenBucket {
             size,
             one_time_burst,
+            initial_one_time_burst: one_time_burst,
             refill_time: complete_refill_time_ms,
             // Start off full.
             budget: size,
@@ -147,9 +154,21 @@ impl TokenBucket {
         })
     }
 
+    // Replenishes token bucket based on elapsed time. Should only be called internally by `Self`.
+    fn auto_replenish(&mut self) {
+        // Compute time passed since last refill/update.
+        let time_delta = self.last_update.elapsed().as_nanos() as u64;
+        self.last_update = Instant::now();
+
+        // At each 'time_delta' nanoseconds the bucket should refill with:
+        // refill_amount = (time_delta * size) / (complete_refill_time_ms * 1_000_000)
+        // `processed_capacity` and `processed_refill_time` are the result of simplifying above
+        // fraction formula with their greatest-common-factor.
+        let tokens = (time_delta * self.processed_capacity) / self.processed_refill_time;
+        self.budget = std::cmp::min(self.budget + tokens, self.size);
+    }
+
     /// Attempts to consume `tokens` from the bucket and returns whether the action succeeded.
-    // TODO (Issue #259): handle cases where a single request is larger than the full capacity
-    // for such cases we need to support partial fulfilment of requests
     pub fn reduce(&mut self, mut tokens: u64) -> BucketReduction {
         // First things first: consume the one-time-burst budget.
         if self.one_time_burst > 0 {
@@ -157,7 +176,8 @@ impl TokenBucket {
             if self.one_time_burst >= tokens {
                 self.one_time_burst -= tokens;
                 self.last_update = Instant::now();
-                // No need to continue to the refill process, we still have burst budget to consume from.
+                // No need to continue to the refill process, we still have burst budget to consume
+                // from.
                 return BucketReduction::Success;
             } else {
                 // We still have burst budget for *some* of the tokens requests.
@@ -167,21 +187,10 @@ impl TokenBucket {
             }
         }
 
-        // Compute time passed since last refill/update.
-        let time_delta = self.last_update.elapsed().as_nanos() as u64;
-        self.last_update = Instant::now();
-
-        // At each 'time_delta' nanoseconds the bucket should refill with:
-        // refill_amount = (time_delta * size) / (complete_refill_time_ms * 1_000_000)
-        // `processed_capacity` and `processed_refill_time` are the result of simplifying above
-        // fraction formula with their greatest-common-factor.
-        self.budget += (time_delta * self.processed_capacity) / self.processed_refill_time;
-
-        if self.budget >= self.size {
-            self.budget = self.size;
-        }
-
         if tokens > self.budget {
+            // Hit the bucket bottom, let's auto-replenish and try again.
+            self.auto_replenish();
+
             // This operation requests a bandwidth higher than the bucket size
             if tokens > self.size {
                 error!(
@@ -194,8 +203,11 @@ impl TokenBucket {
                 self.budget = 0;
                 return BucketReduction::OverConsumption(tokens as f64 / self.size as f64);
             }
-            // If not enough tokens consume() fails, return false.
-            return BucketReduction::Failure;
+
+            if tokens > self.budget {
+                // Still not enough tokens, consume() fails, return false.
+                return BucketReduction::Failure;
+            }
         }
 
         self.budget -= tokens;
@@ -203,7 +215,7 @@ impl TokenBucket {
     }
 
     /// "Manually" adds tokens to bucket.
-    pub fn replenish(&mut self, tokens: u64) {
+    pub fn force_replenish(&mut self, tokens: u64) {
         // This means we are still during the burst interval.
         // Of course there is a very small chance  that the last reduce() also used up burst
         // budget which should now be replenished, but for performance and code-complexity
@@ -233,6 +245,11 @@ impl TokenBucket {
     /// Returns the current budget (one time burst allowance notwithstanding).
     pub fn budget(&self) -> u64 {
         self.budget
+    }
+
+    /// Returns the initially configured one time burst budget.
+    pub fn initial_one_time_burst(&self) -> u64 {
+        self.initial_one_time_burst
     }
 }
 
@@ -419,7 +436,7 @@ impl RateLimiter {
         };
         // Add tokens to the token bucket.
         if let Some(bucket) = token_bucket {
-            bucket.replenish(tokens);
+            bucket.force_replenish(tokens);
         }
     }
 
@@ -498,9 +515,10 @@ impl Default for RateLimiter {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
     use std::thread;
     use std::time::Duration;
+
+    use super::*;
 
     impl TokenBucket {
         // Resets the token bucket: budget set to max capacity and last-updated set to now.
@@ -582,11 +600,6 @@ pub(crate) mod tests {
 
         assert_eq!(tb.reduce(123), BucketReduction::Success);
         assert_eq!(tb.budget(), capacity - 123);
-
-        thread::sleep(Duration::from_millis(123));
-        assert_eq!(tb.reduce(1), BucketReduction::Success);
-        assert_eq!(tb.budget(), capacity - 1);
-        assert_eq!(tb.reduce(100), BucketReduction::Success);
         assert_eq!(tb.reduce(capacity), BucketReduction::Failure);
 
         // token bucket with capacity 1000 and refill time of 1000 milliseconds
@@ -625,8 +638,8 @@ pub(crate) mod tests {
         assert!(l.event_handler().is_err());
         assert_eq!(
             format!("{:?}", l.event_handler().err().unwrap()),
-            "SpuriousRateLimiterEvent(\
-             \"Rate limiter event handler called without a present timer\")"
+            "SpuriousRateLimiterEvent(\"Rate limiter event handler called without a present \
+             timer\")"
         );
     }
 

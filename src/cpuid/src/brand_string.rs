@@ -1,11 +1,12 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::common::{VENDOR_ID_AMD, VENDOR_ID_INTEL};
 use std::arch::x86_64::__cpuid as host_cpuid;
 use std::slice;
 
-#[derive(Debug, PartialEq, Clone)]
+use crate::common::{VENDOR_ID_AMD, VENDOR_ID_INTEL};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     NotSupported,
     Overflow(String),
@@ -13,10 +14,10 @@ pub enum Error {
 
 /// Register designations used to get/set specific register values within the brand string buffer.
 pub enum Reg {
-    EAX = 0,
-    EBX = 1,
-    ECX = 2,
-    EDX = 3,
+    Eax = 0,
+    Ebx = 1,
+    Ecx = 2,
+    Edx = 3,
 }
 
 const BRAND_STRING_INTEL: &[u8] = b"Intel(R) Xeon(R) Processor";
@@ -112,20 +113,13 @@ impl BrandString {
 
         for leaf in 0x8000_0002..=0x8000_0004 {
             cpuid_regs = unsafe { host_cpuid(leaf) };
-            this.set_reg_for_leaf(leaf, Reg::EAX, cpuid_regs.eax);
-            this.set_reg_for_leaf(leaf, Reg::EBX, cpuid_regs.ebx);
-            this.set_reg_for_leaf(leaf, Reg::ECX, cpuid_regs.ecx);
-            this.set_reg_for_leaf(leaf, Reg::EDX, cpuid_regs.edx);
+            this.set_reg_for_leaf(leaf, Reg::Eax, cpuid_regs.eax);
+            this.set_reg_for_leaf(leaf, Reg::Ebx, cpuid_regs.ebx);
+            this.set_reg_for_leaf(leaf, Reg::Ecx, cpuid_regs.ecx);
+            this.set_reg_for_leaf(leaf, Reg::Edx, cpuid_regs.edx);
         }
 
-        let mut len = Self::MAX_LEN;
-        {
-            let this_bytes = this.as_bytes();
-            while this_bytes[len - 1] == 0 && len > 0 {
-                len -= 1;
-            }
-        }
-        this.len = len;
+        this.len = null_terminator_index(this.as_bytes());
 
         Ok(this)
     }
@@ -222,7 +216,7 @@ impl BrandString {
             FoundFreqUnitSize,
             /// Found the H in 'Hz'.
             FoundH,
-        };
+        }
 
         let mut freq_start = 0;
         let mut decimal_start = 0;
@@ -300,6 +294,16 @@ impl BrandString {
     }
 }
 
+/// Find the position of the first null-terminator (\b'0') in a u8 slice,
+/// or return 0 if they're all null-terminators.
+/// This function is roughly equivalent to libc strlen.
+fn null_terminator_index(slice: &[u8]) -> usize {
+    slice
+        .iter()
+        .rposition(|&b| b != b'\0')
+        .map_or(0, |idx| idx + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use std::iter::repeat;
@@ -329,19 +333,19 @@ mod tests {
                 let ecx_offs = (4 * 4) * i + 8;
                 let edx_offs = (4 * 4) * i + 12;
                 assert_eq!(
-                    bstr.get_reg_for_leaf(0x8000_0002 + i as u32, Reg::EAX),
+                    bstr.get_reg_for_leaf(0x8000_0002 + i as u32, Reg::Eax),
                     pack_u32(&TEST_STR[eax_offs..(eax_offs + 4)])
                 );
                 assert_eq!(
-                    bstr.get_reg_for_leaf(0x8000_0002 + i as u32, Reg::EBX),
+                    bstr.get_reg_for_leaf(0x8000_0002 + i as u32, Reg::Ebx),
                     pack_u32(&TEST_STR[ebx_offs..(ebx_offs + 4)])
                 );
                 assert_eq!(
-                    bstr.get_reg_for_leaf(0x8000_0002 + i as u32, Reg::ECX),
+                    bstr.get_reg_for_leaf(0x8000_0002 + i as u32, Reg::Ecx),
                     pack_u32(&TEST_STR[ecx_offs..(ecx_offs + 4)])
                 );
                 assert_eq!(
-                    bstr.get_reg_for_leaf(0x8000_0002 + i as u32, Reg::EDX),
+                    bstr.get_reg_for_leaf(0x8000_0002 + i as u32, Reg::Edx),
                     pack_u32(&TEST_STR[edx_offs..(edx_offs + 4)])
                 );
             }
@@ -353,8 +357,8 @@ mod tests {
 
         // Test mutable bitwise casting and finding the frequency substring
         //
-        bstr.set_reg_for_leaf(0x8000_0003, Reg::EBX, pack_u32(b"5.20"));
-        bstr.set_reg_for_leaf(0x8000_0003, Reg::ECX, pack_u32(b"GHz "));
+        bstr.set_reg_for_leaf(0x8000_0003, Reg::Ebx, pack_u32(b"5.20"));
+        bstr.set_reg_for_leaf(0x8000_0003, Reg::Ecx, pack_u32(b"GHz "));
         assert_eq!(bstr.find_freq().unwrap(), b"5.20GHz");
 
         let _overflow: [u8; 50] = [b'a'; 50];
@@ -388,10 +392,10 @@ mod tests {
             Ok(bstr) => {
                 for leaf in 0x8000_0002..=0x8000_0004_u32 {
                     let host_regs = unsafe { host_cpuid(leaf) };
-                    assert_eq!(bstr.get_reg_for_leaf(leaf, Reg::EAX), host_regs.eax);
-                    assert_eq!(bstr.get_reg_for_leaf(leaf, Reg::EBX), host_regs.ebx);
-                    assert_eq!(bstr.get_reg_for_leaf(leaf, Reg::ECX), host_regs.ecx);
-                    assert_eq!(bstr.get_reg_for_leaf(leaf, Reg::EDX), host_regs.edx);
+                    assert_eq!(bstr.get_reg_for_leaf(leaf, Reg::Eax), host_regs.eax);
+                    assert_eq!(bstr.get_reg_for_leaf(leaf, Reg::Ebx), host_regs.ebx);
+                    assert_eq!(bstr.get_reg_for_leaf(leaf, Reg::Ecx), host_regs.ecx);
+                    assert_eq!(bstr.get_reg_for_leaf(leaf, Reg::Edx), host_regs.edx);
                 }
             }
             Err(Error::NotSupported) => {
@@ -410,6 +414,19 @@ mod tests {
         assert!(bstr.as_bytes().starts_with(BRAND_STRING_AMD));
         let bstr = BrandString::from_vendor_id(b"............");
         assert!(bstr.as_bytes() == vec![b'\0'; 48].as_slice());
+    }
+
+    #[test]
+    /// Prevent against https://github.com/firecracker-microvm/firecracker/issues/2914
+    fn test_null_terminator_index() {
+        let bytes = vec![b'\0'; 48];
+        assert_eq!(null_terminator_index(bytes.as_slice()), 0);
+
+        let bytes = vec![b'h', b'i', b'\0'];
+        assert_eq!(null_terminator_index(bytes.as_slice()), 2);
+
+        let bytes = vec![b'h', b'i', b'\0', b'\0'];
+        assert_eq!(null_terminator_index(bytes.as_slice()), 2);
     }
 
     #[test]

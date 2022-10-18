@@ -56,10 +56,10 @@ fn update_extended_topology_entry(
 ) -> Result<(), Error> {
     use crate::cpu_leaf::leaf_0xb::*;
 
-    //reset eax, ebx, ecx
-    entry.eax = 0 as u32;
-    entry.ebx = 0 as u32;
-    entry.ecx = 0 as u32;
+    // reset eax, ebx, ecx
+    entry.eax = 0_u32;
+    entry.ebx = 0_u32;
+    entry.ecx = 0_u32;
     // EDX bits 31..0 contain x2APIC ID of current logical processor
     // x2APIC increases the size of the APIC ID from 8 bits to 32 bits
     entry.edx = u32::from(vm_spec.cpu_index);
@@ -133,15 +133,16 @@ impl CpuidTransformer for IntelCpuidTransformer {
 
 #[cfg(test)]
 mod tests {
+    use kvm_bindings::kvm_cpuid_entry2;
+
     use super::*;
     use crate::cpu_leaf::leaf_0xb::{LEVEL_TYPE_CORE, LEVEL_TYPE_THREAD};
     use crate::transformer::VmSpec;
-    use kvm_bindings::kvm_cpuid_entry2;
 
     #[test]
     fn test_update_perf_mon_entry() {
         let vm_spec = VmSpec::new(0, 1, false).expect("Error creating vm_spec");
-        let mut entry = &mut kvm_cpuid_entry2 {
+        let entry = &mut kvm_cpuid_entry2 {
             function: leaf_0xa::LEAF_NUM,
             index: 0,
             flags: 0,
@@ -152,7 +153,7 @@ mod tests {
             padding: [0, 0, 0],
         };
 
-        assert!(update_perf_mon_entry(&mut entry, &vm_spec).is_ok());
+        assert!(update_perf_mon_entry(entry, &vm_spec).is_ok());
 
         assert_eq!(entry.eax, 0);
         assert_eq!(entry.ebx, 0);
@@ -162,25 +163,25 @@ mod tests {
 
     fn check_update_deterministic_cache_entry(
         cpu_count: u8,
-        ht_enabled: bool,
+        smt: bool,
         cache_level: u32,
         expected_max_cores_per_package: u32,
     ) {
         use crate::cpu_leaf::leaf_0x4::*;
 
-        let vm_spec = VmSpec::new(0, cpu_count, ht_enabled).expect("Error creating vm_spec");
-        let mut entry = &mut kvm_cpuid_entry2 {
+        let vm_spec = VmSpec::new(0, cpu_count, smt).expect("Error creating vm_spec");
+        let entry = &mut kvm_cpuid_entry2 {
             function: 0x0,
             index: 0,
             flags: 0,
-            eax: *(0 as u32).write_bits_in_range(&eax::CACHE_LEVEL_BITRANGE, cache_level),
+            eax: *(0_u32).write_bits_in_range(&eax::CACHE_LEVEL_BITRANGE, cache_level),
             ebx: 0,
             ecx: 0,
             edx: 0,
             padding: [0, 0, 0],
         };
 
-        assert!(update_deterministic_cache_entry(&mut entry, &vm_spec).is_ok());
+        assert!(update_deterministic_cache_entry(entry, &vm_spec).is_ok());
 
         assert!(
             entry
@@ -192,7 +193,7 @@ mod tests {
 
     fn check_update_extended_topology_entry(
         cpu_count: u8,
-        ht_enabled: bool,
+        smt: bool,
         index: u32,
         expected_apicid: u32,
         expected_num_logical_processors: u32,
@@ -200,8 +201,8 @@ mod tests {
     ) {
         use crate::cpu_leaf::leaf_0xb::*;
 
-        let vm_spec = VmSpec::new(0, cpu_count, ht_enabled).expect("Error creating vm_spec");
-        let mut entry = &mut kvm_cpuid_entry2 {
+        let vm_spec = VmSpec::new(0, cpu_count, smt).expect("Error creating vm_spec");
+        let entry = &mut kvm_cpuid_entry2 {
             function: 0x0,
             index,
             flags: 0,
@@ -212,7 +213,7 @@ mod tests {
             padding: [0, 0, 0],
         };
 
-        assert!(update_extended_topology_entry(&mut entry, &vm_spec).is_ok());
+        assert!(update_extended_topology_entry(entry, &vm_spec).is_ok());
 
         assert!(entry.eax.read_bits_in_range(&eax::APICID_BITRANGE) == expected_apicid);
         assert!(

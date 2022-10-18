@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt::{Display, Formatter, Result};
+use std::fs::File;
 use std::io;
 
 use serde::{Deserialize, Serialize};
+use versionize::{VersionMap, Versionize, VersionizeResult};
+use versionize_derive::Versionize;
 
 /// Default guest kernel command line:
 /// - `reboot=k` shut down the guest on reboot, instead of well... rebooting;
@@ -21,7 +24,7 @@ pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=1 pci=off nomodules 825
 
 /// Strongly typed data structure used to configure the boot source of the
 /// microvm.
-#[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize, Versionize)]
 #[serde(deny_unknown_fields)]
 pub struct BootSourceConfig {
     /// Path of the kernel image.
@@ -49,27 +52,88 @@ impl Display for BootSourceConfigError {
     fn fmt(&self, f: &mut Formatter) -> Result {
         use self::BootSourceConfigError::*;
         match *self {
-            InvalidKernelPath(ref e) => write!(f, "The kernel file cannot be opened: {}", e),
-            InvalidInitrdPath(ref e) => write!(
+            InvalidKernelPath(ref err) => write!(f, "The kernel file cannot be opened: {}", err),
+            InvalidInitrdPath(ref err) => write!(
                 f,
-                "The initrd file cannot be opened due to invalid path or \
-                 invalid permissions. {}",
-                e,
+                "The initrd file cannot be opened due to invalid path or invalid permissions. {}",
+                err,
             ),
-            InvalidKernelCommandLine(ref e) => {
-                write!(f, "The kernel command line is invalid: {}", e.as_str())
+            InvalidKernelCommandLine(ref err) => {
+                write!(f, "The kernel command line is invalid: {}", err.as_str())
             }
         }
     }
 }
 
-/// Holds the kernel configuration.
-#[derive(Debug)]
+/// Holds the kernel specification (both configuration as well as runtime details).
+#[derive(Default)]
+pub struct BootSource {
+    /// The boot source configuration.
+    pub config: BootSourceConfig,
+    /// The boot source builder (a boot source allocated and validated).
+    /// It is an option cause a resumed microVM does not need it.
+    pub builder: Option<BootConfig>,
+}
+
+/// Holds the kernel builder (created and validates based on BootSourceConfig).
 pub struct BootConfig {
     /// The commandline validated against correctness.
-    pub cmdline: kernel::cmdline::Cmdline,
+    pub cmdline: linux_loader::cmdline::Cmdline,
     /// The descriptor to the kernel file.
-    pub kernel_file: std::fs::File,
-    /// The descriptor to the initrd file, if there is one
-    pub initrd_file: Option<std::fs::File>,
+    pub kernel_file: File,
+    /// The descriptor to the initrd file, if there is one.
+    pub initrd_file: Option<File>,
+}
+
+impl BootConfig {
+    /// Creates the BootConfig based on a given configuration.
+    pub fn new(cfg: &BootSourceConfig) -> std::result::Result<Self, BootSourceConfigError> {
+        use self::BootSourceConfigError::{
+            InvalidInitrdPath, InvalidKernelCommandLine, InvalidKernelPath,
+        };
+
+        // Validate boot source config.
+        let kernel_file = File::open(&cfg.kernel_image_path).map_err(InvalidKernelPath)?;
+        let initrd_file: Option<File> = match &cfg.initrd_path {
+            Some(path) => Some(File::open(path).map_err(InvalidInitrdPath)?),
+            None => None,
+        };
+        let mut cmdline = linux_loader::cmdline::Cmdline::new(arch::CMDLINE_MAX_SIZE);
+        let boot_args = match cfg.boot_args.as_ref() {
+            None => DEFAULT_KERNEL_CMDLINE,
+            Some(str) => str.as_str(),
+        };
+        cmdline
+            .insert_str(boot_args)
+            .map_err(|err| InvalidKernelCommandLine(err.to_string()))?;
+
+        Ok(BootConfig {
+            cmdline,
+            kernel_file,
+            initrd_file,
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use utils::tempfile::TempFile;
+
+    use super::*;
+
+    #[test]
+    fn test_boot_config() {
+        let kernel_file = TempFile::new().unwrap();
+        let kernel_path = kernel_file.as_path().to_str().unwrap().to_string();
+
+        let boot_src_cfg = BootSourceConfig {
+            boot_args: None,
+            initrd_path: None,
+            kernel_image_path: kernel_path,
+        };
+
+        let boot_cfg = BootConfig::new(&boot_src_cfg).unwrap();
+        assert!(boot_cfg.initrd_file.is_none());
+        assert_eq!(boot_cfg.cmdline.as_str(), DEFAULT_KERNEL_CMDLINE);
+    }
 }

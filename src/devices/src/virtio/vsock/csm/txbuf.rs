@@ -5,8 +5,7 @@
 use std::io::Write;
 use std::num::Wrapping;
 
-use super::defs;
-use super::{Error, Result};
+use super::{defs, Error, Result};
 
 /// A simple ring-buffer implementation, used by vsock connections to buffer TX (guest -> host)
 /// data.  Memory for this buffer is allocated lazily, since buffering will only be needed when
@@ -95,8 +94,7 @@ impl TxBuf {
 
         // Flushing the buffer can take either one or two writes:
         // - one write, if the tail doesn't need to wrap around to reach the head; or
-        // - two writes, if the tail would wrap around: tail to slice end, then slice end to
-        //   head.
+        // - two writes, if the tail would wrap around: tail to slice end, then slice end to head.
 
         // First write length: the lesser of tail to slice end, or tail to head.
         let len_to_write = std::cmp::min(Self::SIZE - tail_ofs, self.len());
@@ -135,12 +133,23 @@ impl TxBuf {
     }
 }
 
+impl Write for TxBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.push(buf)
+            .map(|()| buf.len())
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io::{Error as IoError, ErrorKind, Result as IoResult, Write};
+
     use super::*;
-    use std::io::Error as IoError;
-    use std::io::Result as IoResult;
-    use std::io::{ErrorKind, Write};
 
     struct TestSink {
         data: Vec<u8>,
@@ -200,6 +209,13 @@ mod tests {
         txbuf.push(&[5, 6, 7, 8]).unwrap();
         txbuf.flush_to(&mut sink).unwrap();
         assert_eq!(sink.data, [1, 2, 3, 4, 5, 6, 7, 8]);
+        sink.clear();
+
+        txbuf.write_all(&[10, 11, 12, 13]).unwrap();
+        txbuf.write_all(&[14, 15, 16, 17]).unwrap();
+        txbuf.flush_to(&mut sink).unwrap();
+        assert_eq!(sink.data, [10, 11, 12, 13, 14, 15, 16, 17]);
+        sink.clear();
     }
 
     #[test]
@@ -216,6 +232,11 @@ mod tests {
         txbuf.push(&[1, 2, 3, 4]).unwrap();
         assert_eq!(txbuf.flush_to(&mut sink).unwrap(), 4);
         assert_eq!(sink.data, [1, 2, 3, 4]);
+        sink.clear();
+
+        txbuf.write_all(&[5, 6, 7, 8]).unwrap();
+        assert_eq!(txbuf.flush_to(&mut sink).unwrap(), 4);
+        assert_eq!(sink.data, [5, 6, 7, 8]);
     }
 
     #[test]
@@ -227,6 +248,16 @@ mod tests {
         txbuf.push(tmp.as_slice()).unwrap();
         match txbuf.push(&[1, 2]) {
             Err(Error::TxBufFull) => (),
+            other => panic!("Unexpected result: {:?}", other),
+        }
+
+        match txbuf.write(&[1, 2]) {
+            Err(err) => {
+                assert_eq!(
+                    format!("{}", err),
+                    "Attempted to push data to a full TX buffer"
+                );
+            }
             other => panic!("Unexpected result: {:?}", other),
         }
     }

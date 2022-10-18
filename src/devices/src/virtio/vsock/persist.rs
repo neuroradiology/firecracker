@@ -6,36 +6,40 @@
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use super::*;
 use snapshot::Persist;
 use versionize::{VersionMap, Versionize, VersionizeError, VersionizeResult};
 use versionize_derive::Versionize;
 use vm_memory::GuestMemoryMmap;
 
+use super::*;
 use crate::virtio::persist::VirtioDeviceState;
-use crate::virtio::{DeviceState, Queue, TYPE_VSOCK};
+use crate::virtio::{DeviceState, TYPE_VSOCK};
 
-#[derive(Versionize)]
+#[derive(Clone, Versionize)]
+// NOTICE: Any changes to this structure require a snapshot version bump.
 pub struct VsockState {
     pub backend: VsockBackendState,
     pub frontend: VsockFrontendState,
 }
 
 /// The Vsock serializable state.
-#[derive(Versionize)]
+#[derive(Clone, Versionize)]
+// NOTICE: Any changes to this structure require a snapshot version bump.
 pub struct VsockFrontendState {
     pub cid: u64,
     virtio_state: VirtioDeviceState,
 }
 
 /// An enum for the serializable backend state types.
-#[derive(Versionize)]
+#[derive(Clone, Versionize)]
+// NOTICE: Any changes to this structure require a snapshot version bump.
 pub enum VsockBackendState {
     Uds(VsockUdsState),
 }
 
 /// The Vsock Unix Backend serializable state.
-#[derive(Versionize)]
+#[derive(Clone, Versionize)]
+// NOTICE: Any changes to this structure require a snapshot version bump.
 pub struct VsockUdsState {
     /// The path for the UDS socket.
     pub(crate) path: String,
@@ -96,27 +100,22 @@ where
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> std::result::Result<Self, Self::Error> {
-        state
-            .virtio_state
-            .sanity_check(TYPE_VSOCK, defs::NUM_QUEUES, defs::QUEUE_SIZE)
-            .map_err(VsockError::VirtioState)?;
-
         // Restore queues.
-        let mut vsock = Self::with_queues(
-            state.cid,
-            constructor_args.backend,
-            state
-                .virtio_state
-                .queues
-                .iter()
-                // Restore POD from QueueState which is safe to unwrap.
-                .map(|qstate| Queue::restore((), qstate).unwrap())
-                .collect(),
-        )?;
+        let queues = state
+            .virtio_state
+            .build_queues_checked(
+                &constructor_args.mem,
+                TYPE_VSOCK,
+                defs::NUM_QUEUES,
+                defs::QUEUE_SIZE,
+            )
+            .map_err(VsockError::VirtioState)?;
+        let mut vsock = Self::with_queues(state.cid, constructor_args.backend, queues)?;
 
         vsock.acked_features = state.virtio_state.acked_features;
         vsock.avail_features = state.virtio_state.avail_features;
-        vsock.interrupt_status = Arc::new(AtomicUsize::new(state.virtio_state.interrupt_status));
+        vsock.irq_trigger.irq_status =
+            Arc::new(AtomicUsize::new(state.virtio_state.interrupt_status));
         vsock.device_state = if state.virtio_state.activated {
             DeviceState::Activated(constructor_args.mem)
         } else {
@@ -128,12 +127,13 @@ where
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::super::tests::{TestBackend, TestContext};
+    use utils::byte_order;
+
     use super::device::AVAIL_FEATURES;
     use super::*;
     use crate::virtio::device::VirtioDevice;
     use crate::virtio::vsock::defs::uapi;
-    use utils::byte_order;
+    use crate::virtio::vsock::test_utils::{TestBackend, TestContext};
 
     impl Persist<'_> for TestBackend {
         type State = VsockBackendState;

@@ -1,17 +1,18 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::convert::TryInto;
+use std::convert::{From, TryInto};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::Path;
 
 use libc::O_NONBLOCK;
-use serde::Deserialize;
+use rate_limiter::{BucketUpdate, RateLimiter, TokenBucket};
+use serde::{Deserialize, Serialize};
 
-use rate_limiter::RateLimiter;
-
+/// Wrapper for configuring the balloon device.
+pub mod balloon;
 /// Wrapper for configuring the microVM boot source.
 pub mod boot_source;
 /// Wrapper for configuring the block devices.
@@ -44,7 +45,7 @@ pub mod vsock;
 
 /// A public-facing, stateless structure, holding all the data we need to create a TokenBucket
 /// (live) object.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TokenBucketConfig {
     /// See TokenBucket::size.
     pub size: u64,
@@ -54,15 +55,73 @@ pub struct TokenBucketConfig {
     pub refill_time: u64,
 }
 
+impl From<&TokenBucket> for TokenBucketConfig {
+    fn from(tb: &TokenBucket) -> Self {
+        let one_time_burst = match tb.initial_one_time_burst() {
+            0 => None,
+            v => Some(v),
+        };
+        TokenBucketConfig {
+            size: tb.capacity(),
+            one_time_burst,
+            refill_time: tb.refill_time_ms(),
+        }
+    }
+}
+
 /// A public-facing, stateless structure, holding all the data we need to create a RateLimiter
 /// (live) object.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimiterConfig {
     /// Data used to initialize the RateLimiter::bandwidth bucket.
     pub bandwidth: Option<TokenBucketConfig>,
     /// Data used to initialize the RateLimiter::ops bucket.
     pub ops: Option<TokenBucketConfig>,
+}
+
+/// A public-facing, stateless structure, specifying RateLimiter properties updates.
+pub struct RateLimiterUpdate {
+    /// Possible update to the RateLimiter::bandwidth bucket.
+    pub bandwidth: BucketUpdate,
+    /// Possible update to the RateLimiter::ops bucket.
+    pub ops: BucketUpdate,
+}
+
+fn get_bucket_update(tb_cfg: &Option<TokenBucketConfig>) -> BucketUpdate {
+    match tb_cfg {
+        // There is data to update.
+        Some(tb_cfg) => {
+            TokenBucket::new(
+                tb_cfg.size,
+                tb_cfg.one_time_burst.unwrap_or(0),
+                tb_cfg.refill_time,
+            )
+            // Updated active rate-limiter.
+            .map(BucketUpdate::Update)
+            // Updated/deactivated rate-limiter
+            .unwrap_or(BucketUpdate::Disabled)
+        }
+        // No update to the rate-limiter.
+        None => BucketUpdate::None,
+    }
+}
+
+impl From<Option<RateLimiterConfig>> for RateLimiterUpdate {
+    fn from(cfg: Option<RateLimiterConfig>) -> Self {
+        if let Some(cfg) = cfg {
+            RateLimiterUpdate {
+                bandwidth: get_bucket_update(&cfg.bandwidth),
+                ops: get_bucket_update(&cfg.ops),
+            }
+        } else {
+            // No update to the rate-limiter.
+            RateLimiterUpdate {
+                bandwidth: BucketUpdate::None,
+                ops: BucketUpdate::None,
+            }
+        }
+    }
 }
 
 impl TryInto<RateLimiter> for RateLimiterConfig {
@@ -82,13 +141,33 @@ impl TryInto<RateLimiter> for RateLimiterConfig {
     }
 }
 
+impl From<&RateLimiter> for RateLimiterConfig {
+    fn from(rl: &RateLimiter) -> Self {
+        RateLimiterConfig {
+            bandwidth: rl.bandwidth().map(TokenBucketConfig::from),
+            ops: rl.ops().map(TokenBucketConfig::from),
+        }
+    }
+}
+
+impl RateLimiterConfig {
+    // Option<T> already implements From<T> so we have to use a custom one.
+    fn into_option(self) -> Option<RateLimiterConfig> {
+        if self.bandwidth.is_some() || self.ops.is_some() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+
 type Result<T> = std::result::Result<T, std::io::Error>;
 
 /// Create and opens a File for writing to it.
 /// In case we open a FIFO, in order to not block the instance if nobody is consuming the message
 /// that is flushed to the two pipes, we are opening it with `O_NONBLOCK` flag.
 /// In this case, writing to a pipe will start failing when reaching 64K of unconsumed content.
-fn open_file_nonblock(path: &PathBuf) -> Result<File> {
+fn open_file_nonblock(path: &Path) -> Result<File> {
     OpenOptions::new()
         .custom_flags(O_NONBLOCK)
         .read(true)
@@ -106,12 +185,12 @@ mod tests {
 
     use super::*;
 
+    const SIZE: u64 = 1024 * 1024;
+    const ONE_TIME_BURST: u64 = 1024;
+    const REFILL_TIME: u64 = 1000;
+
     #[test]
     fn test_rate_limiter_configs() {
-        const SIZE: u64 = 1024 * 1024;
-        const ONE_TIME_BURST: u64 = 1024;
-        const REFILL_TIME: u64 = 1000;
-
         let rlconf = RateLimiterConfig {
             bandwidth: Some(TokenBucketConfig {
                 size: SIZE,
@@ -134,6 +213,27 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_configs() {
+        let bw_tb_cfg = TokenBucketConfig {
+            size: SIZE,
+            one_time_burst: Some(ONE_TIME_BURST),
+            refill_time: REFILL_TIME,
+        };
+        let bw_tb = TokenBucket::new(SIZE, ONE_TIME_BURST, REFILL_TIME).unwrap();
+        let generated_bw_tb_cfg = TokenBucketConfig::from(&bw_tb);
+        assert_eq!(generated_bw_tb_cfg, bw_tb_cfg);
+
+        let rl_conf = RateLimiterConfig {
+            bandwidth: Some(bw_tb_cfg),
+            ops: None,
+        };
+        let rl: RateLimiter = rl_conf.try_into().unwrap();
+        let generated_rl_conf = RateLimiterConfig::from(&rl);
+        assert_eq!(generated_rl_conf, rl_conf);
+        assert_eq!(generated_rl_conf.into_option(), Some(rl_conf));
+    }
+
+    #[test]
     fn test_fifo_line_writer() {
         let log_file_temp =
             TempFile::new().expect("Failed to create temporary output logging file.");
@@ -143,7 +243,7 @@ mod tests {
         let mut fw = FcLineWriter::new(maybe_fifo.unwrap());
 
         let msg = String::from("some message");
-        assert!(fw.write(&msg.as_bytes()).is_ok());
+        assert!(fw.write(msg.as_bytes()).is_ok());
         assert!(fw.flush().is_ok());
     }
 }

@@ -6,8 +6,8 @@
 // found in the THIRD-PARTY file.
 
 /// The vsock object implements the runtime logic of our vsock device:
-/// 1. Respond to TX queue events by wrapping virtio buffers into `VsockPacket`s, then sending those
-///    packets to the `VsockBackend`;
+/// 1. Respond to TX queue events by wrapping virtio buffers into `VsockPacket`s, then sending
+/// those    packets to the `VsockBackend`;
 /// 2. Forward backend FD event notifications to the `VsockBackend`;
 /// 3. Fetch incoming packets from the `VsockBackend` and place them into the virtio RX queue;
 /// 4. Whenever we have processed some virtio buffers (either TX or RX), let the driver know by
@@ -16,17 +16,19 @@
 /// In a nutshell, the logic looks like this:
 /// - on TX queue event:
 ///   - fetch all packets from the TX queue and send them to the backend; then
-///   - if the backend has queued up any incoming packets, fetch them into any available RX buffers.
+///   - if the backend has queued up any incoming packets, fetch them into any available RX
+///     buffers.
 /// - on RX queue event:
 ///   - fetch any incoming packets, queued up by the backend, into newly available RX buffers.
 /// - on backend event:
 ///   - forward the event to the backend; then
-///   - again, attempt to fetch any incoming packets queued by the backend into virtio RX buffers.
+///   - again, attempt to fetch any incoming packets queued by the backend into virtio RX
+///     buffers.
 use std::os::unix::io::AsRawFd;
 
-use logger::{debug, error, warn, Metric, METRICS};
-use polly::event_manager::{EventManager, Subscriber};
-use utils::epoll::{EpollEvent, EventSet};
+use event_manager::{EventOps, Events, MutEventSubscriber};
+use logger::{debug, error, warn, IncMetric, METRICS};
+use utils::epoll::EventSet;
 
 use super::device::{Vsock, EVQ_INDEX, RXQ_INDEX, TXQ_INDEX};
 use super::VsockBackend;
@@ -36,19 +38,18 @@ impl<B> Vsock<B>
 where
     B: VsockBackend + 'static,
 {
-    pub(crate) fn handle_rxq_event(&mut self, event: &EpollEvent) -> bool {
+    pub fn handle_rxq_event(&mut self, evset: EventSet) -> bool {
         debug!("vsock: RX queue event");
 
-        let event_set = event.event_set();
-        if event_set != EventSet::IN {
-            warn!("vsock: rxq unexpected event {:?}", event_set);
+        if evset != EventSet::IN {
+            warn!("vsock: rxq unexpected event {:?}", evset);
             METRICS.vsock.rx_queue_event_fails.inc();
             return false;
         }
 
         let mut raise_irq = false;
-        if let Err(e) = self.queue_events[RXQ_INDEX].read() {
-            error!("Failed to get vsock rx queue event: {:?}", e);
+        if let Err(err) = self.queue_events[RXQ_INDEX].read() {
+            error!("Failed to get vsock rx queue event: {:?}", err);
             METRICS.vsock.rx_queue_event_fails.inc();
         } else if self.backend.has_pending_rx() {
             raise_irq |= self.process_rx();
@@ -57,19 +58,18 @@ where
         raise_irq
     }
 
-    pub(crate) fn handle_txq_event(&mut self, event: &EpollEvent) -> bool {
+    pub fn handle_txq_event(&mut self, evset: EventSet) -> bool {
         debug!("vsock: TX queue event");
 
-        let event_set = event.event_set();
-        if event_set != EventSet::IN {
-            warn!("vsock: txq unexpected event {:?}", event_set);
+        if evset != EventSet::IN {
+            warn!("vsock: txq unexpected event {:?}", evset);
             METRICS.vsock.tx_queue_event_fails.inc();
             return false;
         }
 
         let mut raise_irq = false;
-        if let Err(e) = self.queue_events[TXQ_INDEX].read() {
-            error!("Failed to get vsock tx queue event: {:?}", e);
+        if let Err(err) = self.queue_events[TXQ_INDEX].read() {
+            error!("Failed to get vsock tx queue event: {:?}", err);
             METRICS.vsock.tx_queue_event_fails.inc();
         } else {
             raise_irq |= self.process_tx();
@@ -84,27 +84,26 @@ where
         raise_irq
     }
 
-    fn handle_evq_event(&mut self, event: &EpollEvent) -> bool {
+    pub fn handle_evq_event(&mut self, evset: EventSet) -> bool {
         debug!("vsock: event queue event");
 
-        let event_set = event.event_set();
-        if event_set != EventSet::IN {
-            warn!("vsock: evq unexpected event {:?}", event_set);
+        if evset != EventSet::IN {
+            warn!("vsock: evq unexpected event {:?}", evset);
             METRICS.vsock.ev_queue_event_fails.inc();
             return false;
         }
 
-        if let Err(e) = self.queue_events[EVQ_INDEX].read() {
-            error!("Failed to consume vsock evq event: {:?}", e);
+        if let Err(err) = self.queue_events[EVQ_INDEX].read() {
+            error!("Failed to consume vsock evq event: {:?}", err);
             METRICS.vsock.ev_queue_event_fails.inc();
         }
         false
     }
 
-    fn notify_backend(&mut self, event: &EpollEvent) -> bool {
+    pub fn notify_backend(&mut self, evset: EventSet) -> bool {
         debug!("vsock: backend event");
 
-        self.backend.notify(event.event_set());
+        self.backend.notify(evset);
         // After the backend has been kicked, it might've freed up some resources, so we
         // can attempt to send it more data to process.
         // In particular, if `self.backend.send_pkt()` halted the TX queue processing (by
@@ -117,44 +116,46 @@ where
         raise_irq
     }
 
-    fn handle_activate_event(&self, event_manager: &mut EventManager) {
+    fn register_runtime_events(&self, ops: &mut EventOps) {
+        if let Err(err) = ops.add(Events::new(&self.queue_events[RXQ_INDEX], EventSet::IN)) {
+            error!("Failed to register rx queue event: {}", err);
+        }
+        if let Err(err) = ops.add(Events::new(&self.queue_events[TXQ_INDEX], EventSet::IN)) {
+            error!("Failed to register tx queue event: {}", err);
+        }
+        if let Err(err) = ops.add(Events::new(&self.queue_events[EVQ_INDEX], EventSet::IN)) {
+            error!("Failed to register ev queue event: {}", err);
+        }
+        if let Err(err) = ops.add(Events::new(&self.backend, self.backend.get_polled_evset())) {
+            error!("Failed to register vsock backend event: {}", err);
+        }
+    }
+
+    fn register_activate_event(&self, ops: &mut EventOps) {
+        if let Err(err) = ops.add(Events::new(&self.activate_evt, EventSet::IN)) {
+            error!("Failed to register activate event: {}", err);
+        }
+    }
+
+    fn handle_activate_event(&self, ops: &mut EventOps) {
         debug!("vsock: activate event");
-        if let Err(e) = self.activate_evt.read() {
-            error!("Failed to consume vsock activate event: {:?}", e);
+        if let Err(err) = self.activate_evt.read() {
+            error!("Failed to consume net activate event: {:?}", err);
         }
-        let activate_fd = self.activate_evt.as_raw_fd();
-        // The subscriber must exist as we previously registered activate_evt via
-        // `interest_list()`.
-        let self_subscriber = match event_manager.subscriber(activate_fd) {
-            Ok(subscriber) => subscriber,
-            Err(e) => {
-                error!("Failed to process vsock activate evt: {:?}", e);
-                return;
-            }
-        };
-
-        // Interest list changes when the device is activated.
-        let interest_list = self.interest_list();
-        for event in interest_list {
-            event_manager
-                .register(event.data() as i32, event, self_subscriber.clone())
-                .unwrap_or_else(|e| {
-                    error!("Failed to register vsock events: {:?}", e);
-                });
+        self.register_runtime_events(ops);
+        if let Err(err) = ops.remove(Events::new(&self.activate_evt, EventSet::IN)) {
+            error!("Failed to un-register activate event: {}", err);
         }
-
-        event_manager.unregister(activate_fd).unwrap_or_else(|e| {
-            error!("Failed to unregister vsock activate evt: {:?}", e);
-        });
     }
 }
 
-impl<B> Subscriber for Vsock<B>
+impl<B> MutEventSubscriber for Vsock<B>
 where
     B: VsockBackend + 'static,
 {
-    fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
+    fn process(&mut self, event: Events, ops: &mut EventOps) {
         let source = event.fd();
+        let evset = event.event_set();
         let rxq = self.queue_events[RXQ_INDEX].as_raw_fd();
         let txq = self.queue_events[TXQ_INDEX].as_raw_fd();
         let evq = self.queue_events[EVQ_INDEX].as_raw_fd();
@@ -164,14 +165,14 @@ where
         if self.is_activated() {
             let mut raise_irq = false;
             match source {
-                _ if source == rxq => raise_irq = self.handle_rxq_event(event),
-                _ if source == txq => raise_irq = self.handle_txq_event(event),
-                _ if source == evq => raise_irq = self.handle_evq_event(event),
+                _ if source == rxq => raise_irq = self.handle_rxq_event(evset),
+                _ if source == txq => raise_irq = self.handle_txq_event(evset),
+                _ if source == evq => raise_irq = self.handle_evq_event(evset),
                 _ if source == backend => {
-                    raise_irq = self.notify_backend(event);
+                    raise_irq = self.notify_backend(evset);
                 }
                 _ if source == activate_evt => {
-                    self.handle_activate_event(event_manager);
+                    self.handle_activate_event(ops);
                 }
                 _ => warn!("Unexpected vsock event received: {:?}", source),
             }
@@ -186,81 +187,30 @@ where
         }
     }
 
-    fn interest_list(&self) -> Vec<EpollEvent> {
+    fn init(&mut self, ops: &mut EventOps) {
         // This function can be called during different points in the device lifetime:
         //  - shortly after device creation,
         //  - on device activation (is-activated already true at this point),
         //  - on device restore from snapshot.
         if self.is_activated() {
-            vec![
-                EpollEvent::new(
-                    EventSet::IN,
-                    self.queue_events[RXQ_INDEX].as_raw_fd() as u64,
-                ),
-                EpollEvent::new(
-                    EventSet::IN,
-                    self.queue_events[TXQ_INDEX].as_raw_fd() as u64,
-                ),
-                EpollEvent::new(
-                    EventSet::IN,
-                    self.queue_events[EVQ_INDEX].as_raw_fd() as u64,
-                ),
-                EpollEvent::new(
-                    self.backend.get_polled_evset(),
-                    self.backend.as_raw_fd() as u64,
-                ),
-            ]
+            self.register_runtime_events(ops);
         } else {
-            vec![EpollEvent::new(
-                EventSet::IN,
-                self.activate_evt.as_raw_fd() as u64,
-            )]
+            self.register_activate_event(ops);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
-    use super::super::tests::{EventHandlerContext, TestContext};
+    use event_manager::{EventManager, SubscriberOps};
+    use vm_memory::Bytes;
+
     use super::super::*;
     use super::*;
-
-    use crate::virtio::device::VirtioDevice;
     use crate::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE;
-    use crate::virtio::VIRTIO_MMIO_INT_VRING;
-    use crate::Error as DeviceError;
-
-    #[test]
-    fn test_irq() {
-        // Test case: successful IRQ signaling.
-        {
-            let test_ctx = TestContext::new();
-            let ctx = test_ctx.create_event_handler_context();
-
-            ctx.device.signal_used_queue().unwrap();
-            assert_eq!(
-                ctx.device.interrupt_status.load(Ordering::SeqCst),
-                VIRTIO_MMIO_INT_VRING as usize
-            );
-            assert_eq!(ctx.device.interrupt_evt.read().unwrap(), 1);
-        }
-
-        // Test case: error (a real stretch) - the event counter is full.
-        //
-        {
-            let test_ctx = TestContext::new();
-            let ctx = test_ctx.create_event_handler_context();
-
-            ctx.device.interrupt_evt.write(std::u64::MAX - 1).unwrap();
-            match ctx.device.signal_used_queue() {
-                Err(DeviceError::FailedSignalingUsedQueue(_)) => (),
-                other => panic!("{:?}", other),
-            }
-        }
-    }
+    use crate::virtio::vsock::test_utils::{EventHandlerContext, TestContext};
 
     #[test]
     fn test_txq_event() {
@@ -337,9 +287,7 @@ mod tests {
             let mut ctx = test_ctx.create_event_handler_context();
             ctx.mock_activate(test_ctx.mem.clone());
 
-            assert!(!ctx
-                .device
-                .handle_txq_event(&EpollEvent::new(EventSet::IN, 0)));
+            assert!(!ctx.device.handle_txq_event(EventSet::IN));
         }
     }
 
@@ -388,7 +336,7 @@ mod tests {
             ctx.guest_rxvq.dtable[0].len.set(0);
 
             // The chain should've been processed, without employing the backend.
-            assert_eq!(ctx.device.process_rx(), true);
+            assert!(ctx.device.process_rx());
             assert_eq!(ctx.guest_rxvq.used.idx.get(), 1);
             assert_eq!(ctx.device.backend.rx_ok_cnt, 0);
         }
@@ -399,9 +347,7 @@ mod tests {
             let mut ctx = test_ctx.create_event_handler_context();
             ctx.mock_activate(test_ctx.mem.clone());
             ctx.device.backend.set_pending_rx(false);
-            assert!(!ctx
-                .device
-                .handle_rxq_event(&EpollEvent::new(EventSet::IN, 0)));
+            assert!(!ctx.device.handle_rxq_event(EventSet::IN));
         }
     }
 
@@ -412,9 +358,7 @@ mod tests {
             let test_ctx = TestContext::new();
             let mut ctx = test_ctx.create_event_handler_context();
             ctx.device.backend.set_pending_rx(false);
-            assert!(!ctx
-                .device
-                .handle_evq_event(&EpollEvent::new(EventSet::IN, 0)));
+            assert!(!ctx.device.handle_evq_event(EventSet::IN));
         }
     }
 
@@ -429,7 +373,7 @@ mod tests {
             ctx.mock_activate(test_ctx.mem.clone());
 
             ctx.device.backend.set_pending_rx(true);
-            ctx.device.notify_backend(&EpollEvent::new(EventSet::IN, 0));
+            ctx.device.notify_backend(EventSet::IN);
 
             // The backend should've received this event.
             assert_eq!(ctx.device.backend.evset, Some(EventSet::IN));
@@ -448,7 +392,7 @@ mod tests {
             ctx.mock_activate(test_ctx.mem.clone());
 
             ctx.device.backend.set_pending_rx(false);
-            ctx.device.notify_backend(&EpollEvent::new(EventSet::IN, 0));
+            ctx.device.notify_backend(EventSet::IN);
 
             // The backend should've received this event.
             assert_eq!(ctx.device.backend.evset, Some(EventSet::IN));
@@ -466,7 +410,7 @@ mod tests {
     // desc_idx = 0 we are altering the header (first descriptor in the chain), and when
     // desc_idx = 1 we are altering the packet buffer.
     fn vsock_bof_helper(test_ctx: &mut TestContext, desc_idx: usize, addr: u64, len: u32) {
-        use vm_memory::{Bytes, GuestAddress};
+        use vm_memory::GuestAddress;
 
         assert!(desc_idx <= 1);
 
@@ -506,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_vsock_bof() {
-        use vm_memory::{GuestAddress, GuestMemoryMmap};
+        use vm_memory::GuestAddress;
 
         const GAP_SIZE: usize = 768 << 20;
         const FIRST_AFTER_GAP: usize = 1 << 32;
@@ -514,11 +458,14 @@ mod tests {
         const MIB: usize = 1 << 20;
 
         let mut test_ctx = TestContext::new();
-        test_ctx.mem = GuestMemoryMmap::from_ranges(&[
-            (GuestAddress(0), 8 * MIB),
-            (GuestAddress((GAP_START_ADDR - MIB) as u64), MIB),
-            (GuestAddress(FIRST_AFTER_GAP as u64), MIB),
-        ])
+        test_ctx.mem = vm_memory::test_utils::create_anon_guest_memory(
+            &[
+                (GuestAddress(0), 8 * MIB),
+                (GuestAddress((GAP_START_ADDR - MIB) as u64), MIB),
+                (GuestAddress(FIRST_AFTER_GAP as u64), MIB),
+            ],
+            false,
+        )
         .unwrap();
 
         // The default configured descriptor chains are valid.
@@ -573,7 +520,7 @@ mod tests {
         } = test_ctx.create_event_handler_context();
 
         let vsock = Arc::new(Mutex::new(device));
-        event_manager.add_subscriber(vsock.clone()).unwrap();
+        let _id = event_manager.add_subscriber(vsock.clone());
 
         // Push a queue event
         // - the driver has something to send (there's data in the TX queue); and
@@ -591,14 +538,12 @@ mod tests {
 
         // Manually force a queue event and check it's ignored pre-activation.
         {
-            let mut device = vsock.lock().unwrap();
+            let device = vsock.lock().unwrap();
 
-            let raw_txq_evt = device.queue_events[TXQ_INDEX].as_raw_fd() as u64;
             // Artificially push event.
-            device.process(
-                &EpollEvent::new(EventSet::IN, raw_txq_evt),
-                &mut event_manager,
-            );
+            device.queue_events[TXQ_INDEX].write(1).unwrap();
+            let ev_count = event_manager.run_with_timeout(50).unwrap();
+            assert_eq!(ev_count, 0);
 
             // Both available RX and TX descriptors should be untouched.
             assert_eq!(guest_rxvq.used.idx.get(), 0);

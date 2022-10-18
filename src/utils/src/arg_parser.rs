@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
-use std::env;
-use std::fmt;
-use std::result;
+use std::{env, fmt, result};
 
 pub type Result<T> = result::Result<T, Error>;
 
@@ -14,8 +12,10 @@ const HELP_ARG: &str = "--help";
 const VERSION_ARG: &str = "--version";
 
 /// Errors associated with parsing and validating arguments.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Error {
+    /// The argument B cannot be used together with argument A.
+    ForbiddenArgument(String, String),
     /// The required argument was not provided.
     MissingArgument(String),
     /// A value for the argument was not provided.
@@ -31,6 +31,11 @@ impl fmt::Display for Error {
         use self::Error::*;
 
         match *self {
+            ForbiddenArgument(ref arg1, ref arg2) => write!(
+                f,
+                "Argument '{}' cannot be used together with argument '{}'.",
+                arg2, arg1
+            ),
             MissingArgument(ref arg) => write!(f, "Argument '{}' required, but not found.", arg),
             MissingValue(ref arg) => write!(
                 f,
@@ -128,12 +133,14 @@ impl<'a> ArgParser<'a> {
 }
 
 /// Stores the characteristics of the `name` command line argument.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Argument<'a> {
     name: &'a str,
     required: bool,
     requires: Option<&'a str>,
+    forbids: Vec<&'a str>,
     takes_value: bool,
+    allow_multiple: bool,
     default_value: Option<Value>,
     help: Option<&'a str>,
     user_value: Option<Value>,
@@ -146,7 +153,9 @@ impl<'a> Argument<'a> {
             name,
             required: false,
             requires: None,
+            forbids: vec![],
             takes_value: false,
+            allow_multiple: false,
             default_value: None,
             help: None,
             user_value: None,
@@ -165,6 +174,12 @@ impl<'a> Argument<'a> {
         self
     }
 
+    /// Add `other_arg` as a forbidden parameter when `self` is specified.
+    pub fn forbids(mut self, args: Vec<&'a str>) -> Self {
+        self.forbids = args;
+        self
+    }
+
     /// If `takes_value` is true, then the user *must* provide a value for the
     /// argument, otherwise that argument is a flag.
     pub fn takes_value(mut self, takes_value: bool) -> Self {
@@ -172,10 +187,21 @@ impl<'a> Argument<'a> {
         self
     }
 
+    /// If `allow_multiple` is true, then the user can provide multiple values for the
+    /// argument (e.g --arg val1 --arg val2). It sets the `takes_value` option to true,
+    /// so the user must provides at least one value.
+    pub fn allow_multiple(mut self, allow_multiple: bool) -> Self {
+        if allow_multiple {
+            self.takes_value = true;
+        }
+        self.allow_multiple = allow_multiple;
+        self
+    }
+
     /// Keep a default value which will be used if the user didn't provide a value for
     /// the argument.
     pub fn default_value(mut self, default_value: &'a str) -> Self {
-        self.default_value = Some(Value::String(String::from(default_value)));
+        self.default_value = Some(Value::Single(String::from(default_value)));
         self
     }
 
@@ -218,25 +244,29 @@ impl<'a> Argument<'a> {
     }
 }
 
-/// Represents the value of an argument, which will be a `String` if
-/// the argument takes a value, or `bool` if it's a flag.
-#[derive(Clone, Debug, PartialEq)]
+/// Represents the type of argument, and the values it takes.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
-    Bool(bool),
-    String(String),
+    Flag,
+    Single(String),
+    Multiple(Vec<String>),
 }
 
 impl Value {
-    fn as_string(&self) -> Option<String> {
+    fn as_single_value(&self) -> Option<&String> {
         match self {
-            Value::String(s) => Some(s.to_string()),
+            Value::Single(s) => Some(s),
             _ => None,
         }
     }
 
-    fn as_bool(&self) -> Option<bool> {
+    fn as_flag(&self) -> bool {
+        matches!(self, Value::Flag)
+    }
+
+    fn as_multiple(&self) -> Option<&[String]> {
         match self {
-            Value::Bool(b) => Some(*b),
+            Value::Multiple(v) => Some(v),
             _ => None,
         }
     }
@@ -245,8 +275,9 @@ impl Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Value::Bool(b) => write!(f, "{}", b),
-            Value::String(s) => write!(f, "\"{}\"", s),
+            Value::Flag => write!(f, "true"),
+            Value::Single(s) => write!(f, "\"{}\"", s),
+            Value::Multiple(v) => write!(f, "{:?}", v),
         }
     }
 }
@@ -272,22 +303,30 @@ impl<'a> Arguments<'a> {
             argument
                 .user_value
                 .as_ref()
-                .or_else(|| argument.default_value.as_ref())
+                .or(argument.default_value.as_ref())
         })
     }
 
     /// Return the value of an argument if the argument exists and has the type
     /// String. Otherwise return None.
-    pub fn value_as_string(&self, arg_name: &'static str) -> Option<String> {
+    pub fn single_value(&self, arg_name: &'static str) -> Option<&String> {
         self.value_of(arg_name)
-            .and_then(|arg_value| arg_value.as_string())
+            .and_then(|arg_value| arg_value.as_single_value())
+    }
+
+    /// Return whether an `arg_name` argument of type flag exists.
+    pub fn flag_present(&self, arg_name: &'static str) -> bool {
+        match self.value_of(arg_name) {
+            Some(v) => v.as_flag(),
+            None => false,
+        }
     }
 
     /// Return the value of an argument if the argument exists and has the type
-    /// bool. Otherwise return None.
-    pub fn value_as_bool(&self, arg_name: &'static str) -> Option<bool> {
+    /// vector. Otherwise return None.
+    pub fn multiple_values(&self, arg_name: &'static str) -> Option<&[String]> {
         self.value_of(arg_name)
-            .and_then(|arg_value| arg_value.as_bool())
+            .and_then(|arg_value| arg_value.as_multiple())
     }
 
     /// Get the extra arguments (all arguments after `--`).
@@ -302,7 +341,7 @@ impl<'a> Arguments<'a> {
             return (&args[..index], &args[index + 1..]);
         }
 
-        (&args, &[])
+        (args, &[])
     }
 
     /// Collect the command line arguments and the values provided for them.
@@ -313,7 +352,7 @@ impl<'a> Arguments<'a> {
     }
 
     /// Clear split between the actual arguments of the process, the extra arguments if any
-    /// and the `--help` argument if present.
+    /// and the `--help` and `--version` arguments if present.
     pub fn parse(&mut self, args: &[String]) -> Result<()> {
         // Skipping the first element of `args` as it is the name of the binary.
         let (args, extra_args) = Arguments::split_args(&args[1..]);
@@ -324,7 +363,7 @@ impl<'a> Arguments<'a> {
         // returning.
         if args.contains(&HELP_ARG.to_string()) {
             let mut help_arg = Argument::new("help").help("Show the help message.");
-            help_arg.user_value = Some(Value::Bool(true));
+            help_arg.user_value = Some(Value::Flag);
             self.insert_arg(help_arg);
             return Ok(());
         }
@@ -333,8 +372,8 @@ impl<'a> Arguments<'a> {
         // command line arguments by adding just the version argument to the parsed list and
         // returning.
         if args.contains(&VERSION_ARG.to_string()) {
-            let mut version_arg = Argument::new("version").help("Print the binary version number.");
-            version_arg.user_value = Some(Value::Bool(true));
+            let mut version_arg = Argument::new("version");
+            version_arg.user_value = Some(Value::Flag);
             self.insert_arg(version_arg);
             return Ok(());
         }
@@ -343,19 +382,29 @@ impl<'a> Arguments<'a> {
         self.populate_args(args)
     }
 
-    // Check if `required` and `requires` field rules are indeed followed by every argument.
+    // Check if `required`, `requires` and `forbids` field rules are indeed followed by every
+    // argument.
     fn validate_requirements(&self, args: &[String]) -> Result<()> {
         for argument in self.args.values() {
             // The arguments that are marked `required` must be provided by user.
             if argument.required && argument.user_value.is_none() {
                 return Err(Error::MissingArgument(argument.name.to_string()));
             }
-            // For the arguments that require a specific argument to be also present in the list
-            // of arguments provided by user, search for that argument.
             if argument.user_value.is_some() {
+                // For the arguments that require a specific argument to be also present in the list
+                // of arguments provided by user, search for that argument.
                 if let Some(arg_name) = argument.requires {
                     if !args.contains(&(format!("--{}", arg_name))) {
                         return Err(Error::MissingArgument(arg_name.to_string()));
+                    }
+                }
+                // Check the user-provided list for potential forbidden arguments.
+                for arg_name in argument.forbids.iter() {
+                    if args.contains(&(format!("--{}", arg_name))) {
+                        return Err(Error::ForbiddenArgument(
+                            argument.name.to_string(),
+                            arg_name.to_string(),
+                        ));
                     }
                 }
             }
@@ -371,14 +420,13 @@ impl<'a> Arguments<'a> {
         let arg_name = &arg[ARG_PREFIX.len()..];
 
         // Check if the argument is an expected one and, if yes, check that it was not
-        // provided more than once.
-        if self
+        // provided more than once (unless allow_multiple is set).
+        let argument = self
             .args
             .get(arg_name)
-            .ok_or_else(|| Error::UnexpectedArgument(arg_name.to_string()))?
-            .user_value
-            .is_some()
-        {
+            .ok_or_else(|| Error::UnexpectedArgument(arg_name.to_string()))?;
+
+        if !argument.allow_multiple && argument.user_value.is_some() {
             return Err(Error::DuplicateArgument(arg_name.to_string()));
         }
         Ok(())
@@ -405,16 +453,29 @@ impl<'a> Arguments<'a> {
                     .filter(|v| !v.starts_with(ARG_PREFIX))
                     .ok_or_else(|| Error::MissingValue(argument.name.to_string()))?
                     .clone();
-                Value::String(val)
+
+                if argument.allow_multiple {
+                    match argument.user_value.take() {
+                        Some(Value::Multiple(mut v)) => {
+                            v.push(val);
+                            Value::Multiple(v)
+                        }
+                        None => Value::Multiple(vec![val]),
+                        _ => return Err(Error::UnexpectedArgument(argument.name.to_string())),
+                    }
+                } else {
+                    Value::Single(val)
+                }
             } else {
-                Value::Bool(true)
+                Value::Flag
             };
 
             argument.user_value = Some(arg_val);
         }
 
-        // Check the constraints for the `required` and `requires` fields of all arguments.
-        self.validate_requirements(&args)?;
+        // Check the constraints for the `required`, `requires` and `forbids` fields of all
+        // arguments.
+        self.validate_requirements(args)?;
 
         Ok(())
     }
@@ -452,15 +513,25 @@ mod tests {
                     .help("'id' info."),
             )
             .arg(
-                Argument::new("seccomp-level")
+                Argument::new("seccomp-filter")
                     .takes_value(true)
-                    .default_value("2")
-                    .help("'seccomp-level' info."),
+                    .help("'seccomp-filter' info.")
+                    .forbids(vec!["no-seccomp"]),
+            )
+            .arg(
+                Argument::new("no-seccomp")
+                    .help("'-no-seccomp' info.")
+                    .forbids(vec!["seccomp-filter"]),
             )
             .arg(
                 Argument::new("config-file")
                     .takes_value(true)
                     .help("'config-file' info."),
+            )
+            .arg(
+                Argument::new("describe-snapshot")
+                    .takes_value(true)
+                    .help("'describe-snapshot' info."),
             )
     }
 
@@ -548,18 +619,16 @@ mod tests {
 
         assert_eq!(
             arg_parser.formatted_help(),
-            "required arguments:\n  \
-             --exec-file <exec-file>   'exec-file' info.\n\n\
-             optional arguments:\n  \
-             --api-sock <api-sock>   'api-sock' info."
+            "required arguments:\n  --exec-file <exec-file>   'exec-file' info.\n\noptional \
+             arguments:\n  --api-sock <api-sock>   'api-sock' info."
         );
 
         arg_parser = ArgParser::new()
             .arg(Argument::new("id").takes_value(true).help("'id' info."))
             .arg(
-                Argument::new("seccomp-level")
+                Argument::new("seccomp-filter")
                     .takes_value(true)
-                    .help("'seccomp-level' info."),
+                    .help("'seccomp-filter' info."),
             )
             .arg(
                 Argument::new("config-file")
@@ -569,25 +638,24 @@ mod tests {
 
         assert_eq!(
             arg_parser.formatted_help(),
-            "optional arguments:\n  \
-             --config-file <config-file>       'config-file' info.\n  \
-             --id <id>                         'id' info.\n  \
-             --seccomp-level <seccomp-level>   'seccomp-level' info."
+            "optional arguments:\n  --config-file <config-file>         'config-file' info.\n  \
+             --id <id>                           'id' info.\n  --seccomp-filter <seccomp-filter>   \
+             'seccomp-filter' info."
         );
     }
 
     #[test]
     fn test_value() {
-        //Test `as_string()` and `as_bool()` functions behaviour.
-        let mut value = Value::Bool(true);
-        assert!(Value::as_string(&value).is_none());
-        value = Value::String("arg".to_string());
-        assert_eq!(Value::as_string(&value).unwrap(), "arg".to_string());
+        // Test `as_string()` and `as_flag()` functions behaviour.
+        let mut value = Value::Flag;
+        assert!(Value::as_single_value(&value).is_none());
+        value = Value::Single("arg".to_string());
+        assert_eq!(Value::as_single_value(&value).unwrap(), "arg");
 
-        value = Value::String("arg".to_string());
-        assert!(Value::as_bool(&value).is_none());
-        value = Value::Bool(true);
-        assert_eq!(Value::as_bool(&value).unwrap(), true);
+        value = Value::Single("arg".to_string());
+        assert!(!Value::as_flag(&value));
+        value = Value::Flag;
+        assert!(Value::as_flag(&value));
     }
 
     #[test]
@@ -614,6 +682,36 @@ mod tests {
 
         assert!(arguments.parse(&args).is_ok());
         assert!(arguments.args.contains_key("version"));
+
+        arguments = arg_parser.arguments().clone();
+
+        let args = vec!["binary-name", "--exec-file", "foo", "--describe-snapshot"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<String>>();
+
+        assert_eq!(
+            arguments.parse(&args),
+            Err(Error::MissingValue("describe-snapshot".to_string()))
+        );
+
+        arguments = arg_parser.arguments().clone();
+
+        let args = vec![
+            "binary-name",
+            "--exec-file",
+            "foo",
+            "--describe-snapshot",
+            "--",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<String>>();
+
+        assert_eq!(
+            arguments.parse(&args),
+            Err(Error::MissingValue("describe-snapshot".to_string()))
+        );
 
         arguments = arg_parser.arguments().clone();
 
@@ -753,6 +851,58 @@ mod tests {
             "foo",
             "--api-sock",
             "bar",
+            "--id",
+            "foobar",
+            "--seccomp-filter",
+            "0",
+            "--no-seccomp",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<String>>();
+
+        assert_eq!(
+            arguments.parse(&args),
+            Err(Error::ForbiddenArgument(
+                "no-seccomp".to_string(),
+                "seccomp-filter".to_string(),
+            ))
+        );
+
+        arguments = arg_parser.arguments().clone();
+
+        let args = vec![
+            "binary-name",
+            "--exec-file",
+            "foo",
+            "--api-sock",
+            "bar",
+            "--id",
+            "foobar",
+            "--no-seccomp",
+            "--seccomp-filter",
+            "0",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<String>>();
+
+        assert_eq!(
+            arguments.parse(&args),
+            Err(Error::ForbiddenArgument(
+                "no-seccomp".to_string(),
+                "seccomp-filter".to_string(),
+            ))
+        );
+
+        arguments = arg_parser.arguments().clone();
+
+        let args = vec![
+            "binary-name",
+            "--exec-file",
+            "foo",
+            "--api-sock",
+            "bar",
             "foobar",
         ]
         .into_iter()
@@ -786,7 +936,7 @@ mod tests {
             "bar",
             "--id",
             "foobar",
-            "--seccomp-level",
+            "--seccomp-filter",
             "0",
             "--",
             "--extra-flag",
@@ -829,6 +979,13 @@ mod tests {
     #[test]
     fn test_error_display() {
         assert_eq!(
+            format!(
+                "{}",
+                Error::ForbiddenArgument("foo".to_string(), "bar".to_string())
+            ),
+            "Argument 'bar' cannot be used together with argument 'foo'."
+        );
+        assert_eq!(
             format!("{}", Error::MissingArgument("foo".to_string())),
             "Argument 'foo' required, but not found."
         );
@@ -848,7 +1005,67 @@ mod tests {
 
     #[test]
     fn test_value_display() {
-        assert_eq!(format!("{}", Value::Bool(true)), "true");
-        assert_eq!(format!("{}", Value::String("foo".to_string())), "\"foo\"");
+        assert_eq!(format!("{}", Value::Flag), "true");
+        assert_eq!(format!("{}", Value::Single("foo".to_string())), "\"foo\"");
+    }
+
+    #[test]
+    fn test_allow_multiple() {
+        let arg_parser = ArgParser::new()
+            .arg(
+                Argument::new("no-multiple")
+                    .takes_value(true)
+                    .help("argument that takes just one value."),
+            )
+            .arg(
+                Argument::new("multiple")
+                    .allow_multiple(true)
+                    .help("argument that allows duplication."),
+            );
+
+        let mut arguments = arg_parser.arguments().clone();
+
+        // Check single value arguments fails when multiple values are provided.
+        let args = vec!["binary-name", "--no-multiple", "1", "--no-multiple", "2"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<String>>();
+
+        assert_eq!(
+            arguments.parse(&args),
+            Err(Error::DuplicateArgument("no-multiple".to_string()))
+        );
+
+        arguments = arg_parser.arguments().clone();
+
+        // Check single value arguments works as expected when just one value
+        // is provided for both arguments.
+        let args = vec!["binary-name", "--no-multiple", "1", "--multiple", "2"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<String>>();
+
+        assert!(arguments.parse(&args).is_ok());
+
+        arguments = arg_parser.arguments().clone();
+
+        // Check multiple arg allow multiple values
+        let args = vec!["binary-name", "--multiple", "1", "--multiple", "2"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<String>>();
+
+        assert!(arguments.parse(&args).is_ok());
+
+        // Check dulicates require a value
+        let args = vec!["binary-name", "--multiple", "--multiple", "2"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<String>>();
+
+        assert_eq!(
+            arguments.parse(&args),
+            Err(Error::MissingValue("multiple".to_string()))
+        );
     }
 }

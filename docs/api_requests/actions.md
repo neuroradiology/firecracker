@@ -16,11 +16,7 @@ does not have a payload. It can only be successfully called once.
 ```bash
 curl --unix-socket ${socket} -i \
      -X PUT "http://localhost/actions" \
-     -H "accept: application/json" \
-     -H "Content-Type: application/json" \
-     -d "{
-            \"action_type\": \"InstanceStart\"
-         }"
+     -d '{ "action_type": "InstanceStart" }'
 ```
 
 ## FlushMetrics
@@ -32,14 +28,10 @@ The `FlushMetrics` action flushes the metrics on user demand.
 ```bash
 curl --unix-socket /tmp/firecracker.socket -i \
     -X PUT "http://localhost/actions" \
-    -H  "accept: application/json" \
-    -H  "Content-Type: application/json" \
-    -d "{
-             \"action_type\": \"FlushMetrics\"
-    }"
+    -d '{ "action_type": "FlushMetrics" }'
 ```
 
-## SendCtrlAltDel
+## [Intel and AMD only] SendCtrlAltDel
 
 This action will send the CTRL+ALT+DEL key sequence to the microVM. By
 convention, this sequence has been used to trigger a soft reboot and, as such,
@@ -56,7 +48,9 @@ the guest OS. For Linux, that means the guest kernel needs
 a few tens of milliseconds probing the device. This can be disabled by using
 these kernel command line parameters:
 
-```i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd```
+```console
+i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd
+```
 
 **Note2** This action is only supported on `x86_64` architecture.
 
@@ -65,9 +59,5 @@ these kernel command line parameters:
 ```bash
 curl --unix-socket /tmp/firecracker.socket -i \
     -X PUT "http://localhost/actions" \
-    -H  "accept: application/json" \
-    -H  "Content-Type: application/json" \
-    -d "{
-             \"action_type\": \"SendCtrlAltDel\"
-    }"
+    -d '{ "action_type": "SendCtrlAltDel" }'
 ```

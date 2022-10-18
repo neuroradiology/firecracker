@@ -9,11 +9,13 @@ use kvm_bindings::kvm_lapic_state;
 use kvm_ioctls::VcpuFd;
 use utils::byte_order;
 /// Errors thrown while configuring the LAPIC.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error, PartialEq)]
 pub enum Error {
-    /// Failure in retrieving the LAPIC configuration.
+    /// Failure in getting the LAPIC configuration.
+    #[error("Failure in getting the LAPIC configuration: {0}")]
     GetLapic(kvm_ioctls::Error),
-    /// Failure in modifying the LAPIC configuration.
+    /// Failure in setting the LAPIC configuration.
+    #[error("Failure in setting the LAPIC configuration: {0}")]
     SetLapic(kvm_ioctls::Error),
 }
 type Result<T> = std::result::Result<T, Error>;
@@ -27,13 +29,13 @@ const APIC_MODE_EXTINT: u32 = 0x7;
 fn get_klapic_reg(klapic: &kvm_lapic_state, reg_offset: usize) -> u32 {
     let range = reg_offset..reg_offset + 4;
     let reg = klapic.regs.get(range).expect("get_klapic_reg range");
-    byte_order::read_le_i32(&reg[..]) as u32
+    byte_order::read_le_i32(reg) as u32
 }
 
 fn set_klapic_reg(klapic: &mut kvm_lapic_state, reg_offset: usize, value: u32) {
     let range = reg_offset..reg_offset + 4;
     let reg = klapic.regs.get_mut(range).expect("set_klapic_reg range");
-    byte_order::write_le_i32(&mut reg[..], value as i32)
+    byte_order::write_le_i32(reg, value as i32)
 }
 
 fn set_apic_delivery_mode(reg: u32, mode: u32) -> u32 {
@@ -65,8 +67,9 @@ pub fn set_lint(vcpu: &VcpuFd) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use kvm_ioctls::Kvm;
+
+    use super::*;
 
     const KVM_APIC_REG_SIZE: usize = 0x400;
 
@@ -102,7 +105,7 @@ mod tests {
         let kvm = Kvm::new().unwrap();
         assert!(kvm.check_extension(kvm_ioctls::Cap::Irqchip));
         let vm = kvm.create_vm().unwrap();
-        //the get_lapic ioctl will fail if there is no irqchip created beforehand.
+        // the get_lapic ioctl will fail if there is no irqchip created beforehand.
         assert!(vm.create_irq_chip().is_ok());
         let vcpu = vm.create_vcpu(0).unwrap();
         let klapic_before: kvm_lapic_state = vcpu.get_lapic().unwrap();

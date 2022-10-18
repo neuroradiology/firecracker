@@ -20,7 +20,7 @@ use serde::ser::{Serialize, Serializer};
 pub const MAC_ADDR_LEN: usize = 6;
 
 /// Represents a MAC address
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Representation of a MAC address.
 pub struct MacAddr {
     bytes: [u8; MAC_ADDR_LEN],
@@ -87,13 +87,13 @@ impl MacAddr {
         // TODO: using something like std::mem::uninitialized could avoid the extra initialization,
         // if this ever becomes a performance bottleneck.
         let mut bytes = [0u8; MAC_ADDR_LEN];
-        bytes[..].copy_from_slice(&src[..]);
+        bytes[..].copy_from_slice(src);
 
         MacAddr { bytes }
     }
 
     /// Create a `MacAddr` from a slice.
-    /// An error will occur if the slice length is different from `MAC_ADDR_LEN`.
+    /// This method will return None if the slice length is different from `MAC_ADDR_LEN`.
     /// # Arguments
     ///
     /// * `src` - slice from which to copy MAC address content.
@@ -105,11 +105,11 @@ impl MacAddr {
     /// println!("{}", mac.to_string());
     /// ```
     #[inline]
-    pub fn from_bytes(src: &[u8]) -> Result<MacAddr, ()> {
+    pub fn from_bytes(src: &[u8]) -> Option<MacAddr> {
         if src.len() != MAC_ADDR_LEN {
-            return Err(());
+            return None;
         }
-        Ok(MacAddr::from_bytes_unchecked(src))
+        Some(MacAddr::from_bytes_unchecked(src))
     }
 
     /// Return the underlying content of this `MacAddr` in bytes.
@@ -165,7 +165,7 @@ mod tests {
 
         let mac = MacAddr::parse_str("12:34:56:78:9a:BC").unwrap();
 
-        println!("parsed MAC address: {}", mac.to_string());
+        println!("parsed MAC address: {}", mac);
 
         let bytes = mac.get_bytes();
         assert_eq!(bytes, [0x12u8, 0x34, 0x56, 0x78, 0x9a, 0xbc]);
@@ -177,12 +177,12 @@ mod tests {
         let src2 = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
         let src3 = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
 
-        assert!(MacAddr::from_bytes(&src1[..]).is_err());
+        assert!(MacAddr::from_bytes(&src1[..]).is_none());
 
         let x = MacAddr::from_bytes(&src2[..]).unwrap();
         assert_eq!(x.to_string(), String::from("01:02:03:04:05:06"));
 
-        assert!(MacAddr::from_bytes(&src3[..]).is_err());
+        assert!(MacAddr::from_bytes(&src3[..]).is_none());
     }
 
     #[test]

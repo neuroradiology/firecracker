@@ -3,39 +3,55 @@
 
 //! Enables pre-boot setup, instantiation and booting of a Firecracker VMM.
 
-#[cfg(target_arch = "x86_64")]
 use std::convert::TryFrom;
 use std::fmt::{Display, Formatter};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 
-use crate::device_manager::mmio::MMIODeviceManager;
-#[cfg(target_arch = "x86_64")]
-use crate::device_manager::{legacy::PortIODeviceManager, persist::MMIODevManagerConstructorArgs};
-#[cfg(target_arch = "x86_64")]
-use crate::persist::{MicrovmState, MicrovmStateError};
-use crate::vmm_config::boot_source::BootConfig;
-use crate::vstate::{
-    system::KvmContext,
-    vcpu::{Vcpu, VcpuConfig},
-    vm::Vm,
-};
-use crate::{device_manager, Error, Vmm, VmmEventsObserver};
-
 use arch::InitrdConfig;
-use devices::legacy::Serial;
-use devices::virtio::{Block, MmioTransport, Net, VirtioDevice, Vsock, VsockUnixBackend};
-use kernel::cmdline::Cmdline as KernelCmdline;
-use logger::warn;
-use polly::event_manager::{Error as EventManagerError, EventManager, Subscriber};
-use seccomp::{BpfProgramRef, SeccompFilter};
 #[cfg(target_arch = "x86_64")]
+use cpuid::common::is_same_model;
+use devices::legacy::serial::ReadableFd;
+#[cfg(target_arch = "aarch64")]
+use devices::legacy::RTCDevice;
+use devices::legacy::{EventFdTrigger, SerialDevice, SerialEventsWrapper, SerialWrapper};
+use devices::virtio::{Balloon, Block, MmioTransport, Net, VirtioDevice, Vsock, VsockUnixBackend};
+use event_manager::{MutEventSubscriber, SubscriberOps};
+use libc::EFD_NONBLOCK;
+use linux_loader::cmdline::Cmdline as LoaderKernelCmdline;
+#[cfg(target_arch = "x86_64")]
+use linux_loader::loader::elf::Elf as Loader;
+#[cfg(target_arch = "aarch64")]
+use linux_loader::loader::pe::PE as Loader;
+use linux_loader::loader::KernelLoader;
+use logger::{error, warn, METRICS};
+use seccompiler::BpfThreadMap;
 use snapshot::Persist;
+use userfaultfd::Uffd;
 use utils::eventfd::EventFd;
 use utils::terminal::Terminal;
 use utils::time::TimestampUs;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+#[cfg(target_arch = "aarch64")]
+use vm_superio::Rtc;
+use vm_superio::Serial;
+
+#[cfg(target_arch = "aarch64")]
+use crate::construct_kvm_mpidrs;
+#[cfg(target_arch = "x86_64")]
+use crate::device_manager::legacy::PortIODeviceManager;
+use crate::device_manager::mmio::MMIODeviceManager;
+use crate::device_manager::persist::MMIODevManagerConstructorArgs;
+use crate::persist::{MicrovmState, MicrovmStateError};
+use crate::resources::VmResources;
+use crate::vmm_config::boot_source::BootConfig;
+use crate::vmm_config::instance_info::InstanceInfo;
+use crate::vmm_config::machine_config::{VmConfigError, VmUpdateConfig};
+use crate::vstate::system::KvmContext;
+use crate::vstate::vcpu::{Vcpu, VcpuConfig};
+use crate::vstate::vm::Vm;
+use crate::{device_manager, Error, EventManager, Vmm, VmmEventsObserver};
 
 /// Errors associated with starting the instance.
 #[derive(Debug)]
@@ -59,33 +75,32 @@ pub enum StartMicrovmError {
     /// The kernel command line is invalid.
     KernelCmdline(String),
     /// Cannot load kernel due to invalid memory configuration or invalid kernel image.
-    KernelLoader(kernel::loader::Error),
+    KernelLoader(linux_loader::loader::Error),
     /// Cannot load command line string.
-    LoadCommandline(kernel::cmdline::Error),
-    /// The start command was issued more than once.
-    MicroVMAlreadyRunning,
-    /// Cannot start the VM because the kernel was not configured.
+    LoadCommandline(linux_loader::loader::Error),
+    /// Cannot start the VM because the kernel builder was not configured.
     MissingKernelConfig,
     /// Cannot start the VM because the size of the guest memory  was not specified.
     MissingMemSizeConfig,
+    /// The seccomp filter map is missing a key.
+    MissingSeccompFilters(String),
     /// The net device configuration is missing the tap device.
     NetDeviceNotConfigured,
     /// Cannot open the block device backing file.
     OpenBlockDevice(io::Error),
-    /// Cannot register an EventHandler.
-    RegisterEvent(EventManagerError),
     /// Cannot initialize a MMIO Device or add a device to the MMIO Bus or cmdline.
     RegisterMmioDevice(device_manager::mmio::Error),
-    #[cfg(target_arch = "x86_64")]
     /// Cannot restore microvm state.
     RestoreMicrovmState(MicrovmStateError),
+    /// Unable to set VmResources.
+    SetVmResources(VmConfigError),
 }
-
-/// It's convenient to automatically convert `kernel::cmdline::Error`s
+impl std::error::Error for StartMicrovmError {}
+/// It's convenient to automatically convert `linux_loader::cmdline::Error`s
 /// to `StartMicrovmError`s.
-impl std::convert::From<kernel::cmdline::Error> for StartMicrovmError {
-    fn from(e: kernel::cmdline::Error) -> StartMicrovmError {
-        StartMicrovmError::KernelCmdline(e.to_string())
+impl std::convert::From<linux_loader::cmdline::Error> for StartMicrovmError {
+    fn from(err: linux_loader::cmdline::Error) -> StartMicrovmError {
+        StartMicrovmError::KernelCmdline(err.to_string())
     }
 }
 
@@ -94,20 +109,20 @@ impl Display for StartMicrovmError {
         use self::StartMicrovmError::*;
         match self {
             AttachBlockDevice(err) => {
-                write!(f, "Unable to attach block device to Vmm. Error: {}", err)
+                write!(f, "Unable to attach block device to Vmm: {}", err)
             }
-            ConfigureSystem(e) => write!(f, "System configuration error: {:?}", e),
+            ConfigureSystem(err) => write!(f, "System configuration error: {:?}", err),
             CreateRateLimiter(err) => write!(f, "Cannot create RateLimiter: {}", err),
             CreateNetDevice(err) => {
                 let mut err_msg = format!("{:?}", err);
-                err_msg = err_msg.replace("\"", "");
+                err_msg = err_msg.replace('\"', "");
 
                 write!(f, "Cannot create network device. {}", err_msg)
             }
             GuestMemoryMmap(err) => {
                 // Remove imbricated quotes from error message.
                 let mut err_msg = format!("{:?}", err);
-                err_msg = err_msg.replace("\"", "");
+                err_msg = err_msg.replace('\"', "");
                 write!(f, "Invalid Memory Configuration: {}", err_msg)
             }
             InitrdLoad => write!(
@@ -115,11 +130,11 @@ impl Display for StartMicrovmError {
                 "Cannot load initrd due to an invalid memory configuration."
             ),
             InitrdRead(err) => write!(f, "Cannot load initrd due to an invalid image: {}", err),
-            Internal(err) => write!(f, "Internal error while starting microVM: {:?}", err),
+            Internal(err) => write!(f, "Internal error while starting microVM: {}", err),
             KernelCmdline(err) => write!(f, "Invalid kernel command line: {}", err),
             KernelLoader(err) => {
                 let mut err_msg = format!("{}", err);
-                err_msg = err_msg.replace("\"", "");
+                err_msg = err_msg.replace('\"', "");
                 write!(
                     f,
                     "Cannot load kernel due to invalid memory configuration or invalid kernel \
@@ -129,41 +144,45 @@ impl Display for StartMicrovmError {
             }
             LoadCommandline(err) => {
                 let mut err_msg = format!("{}", err);
-                err_msg = err_msg.replace("\"", "");
+                err_msg = err_msg.replace('\"', "");
                 write!(f, "Cannot load command line string. {}", err_msg)
             }
-            MicroVMAlreadyRunning => write!(f, "Microvm already running."),
             MissingKernelConfig => write!(f, "Cannot start microvm without kernel configuration."),
             MissingMemSizeConfig => {
                 write!(f, "Cannot start microvm without guest mem_size config.")
             }
+            MissingSeccompFilters(thread_category) => write!(
+                f,
+                "No seccomp filter for thread category: {}",
+                thread_category
+            ),
             NetDeviceNotConfigured => {
                 write!(f, "The net device configuration is missing the tap device.")
             }
             OpenBlockDevice(err) => {
                 let mut err_msg = format!("{:?}", err);
-                err_msg = err_msg.replace("\"", "");
+                err_msg = err_msg.replace('\"', "");
 
                 write!(f, "Cannot open the block device backing file. {}", err_msg)
             }
-            RegisterEvent(err) => write!(f, "Cannot register EventHandler. {:?}", err),
             RegisterMmioDevice(err) => {
                 let mut err_msg = format!("{}", err);
-                err_msg = err_msg.replace("\"", "");
+                err_msg = err_msg.replace('\"', "");
                 write!(
                     f,
-                    "Cannot initialize a MMIO Device or add a device to the MMIO Bus or cmdline. {}",
+                    "Cannot initialize a MMIO Device or add a device to the MMIO Bus or cmdline. \
+                     {}",
                     err_msg
                 )
             }
-            #[cfg(target_arch = "x86_64")]
             RestoreMicrovmState(err) => write!(f, "Cannot restore microvm state. Error: {}", err),
+            SetVmResources(err) => write!(f, "Cannot set vm resources. Error: {}", err),
         }
     }
 }
 
 // Wrapper over io::Stdin that implements `Serial::ReadableFd` and `vmm::VmmEventsObserver`.
-struct SerialStdin(io::Stdin);
+pub(crate) struct SerialStdin(io::Stdin);
 impl SerialStdin {
     /// Returns a `SerialStdin` wrapper over `io::stdin`.
     pub fn get() -> Self {
@@ -183,28 +202,36 @@ impl AsRawFd for SerialStdin {
     }
 }
 
-impl devices::legacy::ReadableFd for SerialStdin {}
+impl ReadableFd for SerialStdin {}
 
 impl VmmEventsObserver for SerialStdin {
     fn on_vmm_boot(&mut self) -> std::result::Result<(), utils::errno::Error> {
         // Set raw mode for stdin.
-        self.0.lock().set_raw_mode().map_err(|e| {
-            warn!("Cannot set raw mode for the terminal. {:?}", e);
-            e
+        self.0.lock().set_raw_mode().map_err(|err| {
+            warn!("Cannot set raw mode for the terminal. {:?}", err);
+            err
+        })?;
+
+        // Set non blocking stdin.
+        self.0.lock().set_non_block(true).map_err(|err| {
+            warn!("Cannot set non block for the terminal. {:?}", err);
+            err
         })
     }
     fn on_vmm_stop(&mut self) -> std::result::Result<(), utils::errno::Error> {
-        self.0.lock().set_canon_mode().map_err(|e| {
-            warn!("Cannot set canonical mode for the terminal. {:?}", e);
-            e
+        self.0.lock().set_canon_mode().map_err(|err| {
+            warn!("Cannot set canonical mode for the terminal. {:?}", err);
+            err
         })
     }
 }
 
 #[cfg_attr(target_arch = "aarch64", allow(unused))]
 fn create_vmm_and_vcpus(
+    instance_info: &InstanceInfo,
     event_manager: &mut EventManager,
     guest_memory: GuestMemoryMmap,
+    uffd: Option<Uffd>,
     track_dirty_pages: bool,
     vcpu_count: u8,
 ) -> std::result::Result<(Vmm, Vec<Vcpu>), StartMicrovmError> {
@@ -213,16 +240,19 @@ fn create_vmm_and_vcpus(
     // Set up Kvm Vm and register memory regions.
     let mut vm = setup_kvm_vm(&guest_memory, track_dirty_pages)?;
 
-    // Vmm exit event.
-    let exit_evt = EventFd::new(libc::EFD_NONBLOCK)
+    let vcpus_exit_evt = EventFd::new(libc::EFD_NONBLOCK)
         .map_err(Error::EventFd)
         .map_err(Internal)?;
 
     // Instantiate the MMIO device manager.
     // 'mmio_base' address has to be an address which is protected by the kernel
     // and is architectural specific.
-    let mmio_device_manager =
-        MMIODeviceManager::new(arch::MMIO_MEM_START, (arch::IRQ_BASE, arch::IRQ_MAX));
+    let mmio_device_manager = MMIODeviceManager::new(
+        arch::MMIO_MEM_START,
+        arch::MMIO_MEM_SIZE,
+        (arch::IRQ_BASE, arch::IRQ_MAX),
+    )
+    .map_err(StartMicrovmError::RegisterMmioDevice)?;
 
     let vcpus;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
@@ -230,7 +260,10 @@ fn create_vmm_and_vcpus(
     #[cfg(target_arch = "x86_64")]
     let pio_device_manager = {
         setup_interrupt_controller(&mut vm)?;
-        vcpus = create_vcpus(&vm, vcpu_count, &exit_evt).map_err(Internal)?;
+        vcpus = create_vcpus(&vm, vcpu_count, &vcpus_exit_evt).map_err(Internal)?;
+
+        // Make stdout non blocking.
+        set_stdout_nonblocking();
 
         // Serial device setup.
         let serial_device = setup_serial_device(
@@ -238,9 +271,9 @@ fn create_vmm_and_vcpus(
             Box::new(SerialStdin::get()),
             Box::new(io::stdout()),
         )
-        .map_err(StartMicrovmError::Internal)?;
+        .map_err(Internal)?;
         // x86_64 uses the i8042 reset event as the Vmm exit event.
-        let reset_evt = exit_evt
+        let reset_evt = vcpus_exit_evt
             .try_clone()
             .map_err(Error::EventFd)
             .map_err(Internal)?;
@@ -254,16 +287,19 @@ fn create_vmm_and_vcpus(
     // Search for `kvm_arch_vcpu_create` in arch/arm/kvm/arm.c.
     #[cfg(target_arch = "aarch64")]
     {
-        vcpus = create_vcpus(&vm, vcpu_count, &exit_evt).map_err(Internal)?;
+        vcpus = create_vcpus(&vm, vcpu_count, &vcpus_exit_evt).map_err(Internal)?;
         setup_interrupt_controller(&mut vm, vcpu_count)?;
     }
 
     let vmm = Vmm {
         events_observer: Some(Box::new(SerialStdin::get())),
-        guest_memory,
-        vcpus_handles: Vec::new(),
-        exit_evt,
+        instance_info: instance_info.clone(),
+        shutdown_exit_code: None,
         vm,
+        guest_memory,
+        uffd,
+        vcpus_handles: Vec::new(),
+        vcpus_exit_evt,
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
@@ -280,39 +316,68 @@ fn create_vmm_and_vcpus(
 /// An `Arc` reference of the built `Vmm` is also plugged in the `EventManager`, while another
 /// is returned.
 pub fn build_microvm_for_boot(
+    instance_info: &InstanceInfo,
     vm_resources: &super::resources::VmResources,
     event_manager: &mut EventManager,
-    seccomp_filter: BpfProgramRef,
+    seccomp_filters: &BpfThreadMap,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     use self::StartMicrovmError::*;
-    let boot_config = vm_resources.boot_source().ok_or(MissingKernelConfig)?;
-
-    let guest_memory = create_guest_memory(
-        vm_resources
-            .vm_config()
-            .mem_size_mib
-            .ok_or(MissingMemSizeConfig)?,
-    )?;
-    let vcpu_config = vm_resources.vcpu_config();
-    let track_dirty_pages = vm_resources.track_dirty_pages();
-    let entry_addr = load_kernel(boot_config, &guest_memory)?;
-    let initrd = load_initrd_from_config(boot_config, &guest_memory)?;
-    // Clone the command-line so that a failed boot doesn't pollute the original.
-    #[allow(unused_mut)]
-    let mut boot_cmdline = boot_config.cmdline.clone();
 
     // Timestamp for measuring microVM boot duration.
     let request_ts = TimestampUs::default();
 
+    let boot_config = vm_resources
+        .boot_source_builder()
+        .ok_or(MissingKernelConfig)?;
+
+    let track_dirty_pages = vm_resources.track_dirty_pages();
+    let guest_memory =
+        create_guest_memory(vm_resources.vm_config().mem_size_mib, track_dirty_pages)?;
+    let vcpu_config = vm_resources.vcpu_config();
+    let entry_addr = load_kernel(boot_config, &guest_memory)?;
+    let initrd = load_initrd_from_config(boot_config, &guest_memory)?;
+    // Clone the command-line so that a failed boot doesn't pollute the original.
+    #[allow(unused_mut)]
+    let mut boot_cmdline = linux_loader::cmdline::Cmdline::new(arch::CMDLINE_MAX_SIZE);
+
+    // We're splitting the boot_args in regular parameters and init arguments.
+    // This is needed because on x86_64 we're altering the boot arguments by
+    // adding the virtio device configuration. We need to make sure that the init
+    // parameters are last, specified after -- as specified in the kernel docs
+    // (https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html).
+    let init_and_regular = boot_config
+        .cmdline
+        .as_str()
+        .split("--")
+        .collect::<Vec<&str>>();
+    if init_and_regular.len() > 2 {
+        return Err(StartMicrovmError::KernelCmdline(
+            "Too many `--` in kernel cmdline.".to_string(),
+        ));
+    }
+    let boot_args = init_and_regular[0];
+    let init_params = init_and_regular.get(1);
+
+    boot_cmdline.insert_str(boot_args)?;
+
     let (mut vmm, mut vcpus) = create_vmm_and_vcpus(
+        instance_info,
         event_manager,
         guest_memory,
+        None,
         track_dirty_pages,
         vcpu_config.vcpu_count,
     )?;
 
+    // The boot timer device needs to be the first device attached in order
+    // to maintain the same MMIO address referenced in the documentation
+    // and tests.
     if vm_resources.boot_timer {
         attach_boot_timer_device(&mut vmm, request_ts)?;
+    }
+
+    if let Some(balloon) = vm_resources.balloon.get() {
+        attach_balloon_device(&mut vmm, &mut boot_cmdline, balloon, event_manager)?;
     }
 
     attach_block_devices(
@@ -331,6 +396,10 @@ pub fn build_microvm_for_boot(
         attach_unixsock_vsock_device(&mut vmm, &mut boot_cmdline, unix_vsock, event_manager)?;
     }
 
+    if let Some(init) = init_params {
+        boot_cmdline.insert_str(format!("--{}", init))?;
+    }
+
     #[cfg(target_arch = "aarch64")]
     attach_legacy_devices_aarch64(event_manager, &mut vmm, &mut boot_cmdline).map_err(Internal)?;
 
@@ -344,87 +413,204 @@ pub fn build_microvm_for_boot(
     )?;
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
-    vmm.start_vcpus(vcpus, seccomp_filter).map_err(Internal)?;
+    vmm.start_vcpus(
+        vcpus,
+        seccomp_filters
+            .get("vcpu")
+            .ok_or_else(|| MissingSeccompFilters("vcpu".to_string()))?
+            .clone(),
+    )
+    .map_err(Error::VcpuStart)
+    .map_err(StartMicrovmError::Internal)?;
 
     // Load seccomp filters for the VMM thread.
-    // Execution panics if filters cannot be loaded, use --seccomp-level=0 if skipping filters
+    // Execution panics if filters cannot be loaded, use --no-seccomp if skipping filters
     // altogether is the desired behaviour.
     // Keep this as the last step before resuming vcpus.
-    SeccompFilter::apply(seccomp_filter.to_vec())
-        .map_err(Error::SeccompFilters)
-        .map_err(Internal)?;
+    seccompiler::apply_filter(
+        seccomp_filters
+            .get("vmm")
+            .ok_or_else(|| MissingSeccompFilters("vmm".to_string()))?,
+    )
+    .map_err(Error::SeccompFilters)
+    .map_err(StartMicrovmError::Internal)?;
 
     // The vcpus start off in the `Paused` state, let them run.
-    vmm.resume_vcpus().map_err(Internal)?;
+    vmm.resume_vm().map_err(Internal)?;
 
     let vmm = Arc::new(Mutex::new(vmm));
-    event_manager
-        .add_subscriber(vmm.clone())
-        .map_err(RegisterEvent)?;
+    event_manager.add_subscriber(vmm.clone());
 
     Ok(vmm)
+}
+
+/// Error type for [`build_microvm_from_snapshot`].
+#[derive(Debug, thiserror::Error)]
+pub enum BuildMicrovmFromSnapshotError {
+    /// Failed to create micro-VM and vCPUs.
+    #[error("Failed to create micro-VM and vCPUs: {0}")]
+    CreateMicrovmAndVcpus(#[from] StartMicrovmError),
+    /// Only 255 vCPU state are supported, but {0} states where given.
+    #[error("Only 255 vCPU state are supported, but {0} states where given.")]
+    TooManyVCPUs(usize),
+    /// Could not access KVM.
+    #[error("Could not access KVM: {0}")]
+    KvmAccess(#[from] utils::errno::Error),
+    /// The CPUID specification from the snapshot contains features unsupported by and/or fields
+    /// outside the supported range, of the KVM.
+    #[error(
+        "The CPUID specification from the snapshot contains features unsupported by and/or fields \
+         outside the supported range, of the KVM"
+    )]
+    UnsupportedCPUID,
+    /// Error configuring the TSC, frequency not present in the given snapshot.
+    #[error("Error configuring the TSC, frequency not present in the given snapshot.")]
+    TscFrequencyNotPresent,
+    /// Could not get TSC to check if TSC scaling was required with the snapshot.
+    #[cfg(target_arch = "x86_64")]
+    #[error("Could not get TSC to check if TSC scaling was required with the snapshot: {0}")]
+    GetTsc(#[from] crate::vstate::vcpu::GetTscError),
+    /// Could not set TSC scaling within the snapshot.
+    #[cfg(target_arch = "x86_64")]
+    #[error("Could not set TSC scaling within the snapshot: {0}")]
+    SetTsc(#[from] crate::vstate::vcpu::SetTscError),
+    /// Failed to restore micro-VM state.
+    #[error("Failed to restore micro-VM state: {0}")]
+    RestoreState(#[from] crate::vstate::vm::RestoreStateError),
+    /// Failed to update micr-VM configuration.
+    #[error("Failed to update micr-VM configuration: {0}")]
+    VmUpdateConfig(#[from] VmConfigError),
+    /// Failed to restore MMIO device.
+    #[error("Failed to restore MMIO device: {0}")]
+    RestoreMmioDevice(#[from] MicrovmStateError),
+    /// Failed to emulate MMIO serial.
+    #[error("Failed to emulate MMIO serial: {0}")]
+    EmulateSerialInit(#[from] crate::EmulateSerialInitError),
+    /// Failed start vCPUs as no vCPU seccomp filter found.
+    #[error("Failed start vCPUs as no vCPU seccomp filter found.")]
+    MissingVcpuSeccompFilters,
+    /// Failed start vCPUs.
+    #[error("Failed start vCPUs: {0}")]
+    StartVcpus(#[from] crate::StartVcpusError),
+    /// Failed to restore vCPUs.
+    #[error("Failed to restore vCPUs: {0}")]
+    RestoreVcpus(#[from] crate::RestoreVcpusError),
+    /// Failed to apply VMM secccomp filter as none found.
+    #[error("Failed to apply VMM secccomp filter as none found.")]
+    MissingVmmSeccompFilters,
+    /// Failed to apply VMM secccomp filter.
+    #[error("Failed to apply VMM secccomp filter: {0}")]
+    SeccompFiltersInternal(#[from] seccompiler::InstallationError),
 }
 
 /// Builds and starts a microVM based on the provided MicrovmState.
 ///
 /// An `Arc` reference of the built `Vmm` is also plugged in the `EventManager`, while another
 /// is returned.
-#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
 pub fn build_microvm_from_snapshot(
+    instance_info: &InstanceInfo,
     event_manager: &mut EventManager,
     microvm_state: MicrovmState,
     guest_memory: GuestMemoryMmap,
+    uffd: Option<Uffd>,
     track_dirty_pages: bool,
-    seccomp_filter: BpfProgramRef,
-) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
-    use self::StartMicrovmError::*;
-    let vcpu_count = u8::try_from(microvm_state.vcpu_states.len())
-        .map_err(|_| MicrovmStateError::InvalidInput)
-        .map_err(RestoreMicrovmState)?;
+    seccomp_filters: &BpfThreadMap,
+    vm_resources: &mut VmResources,
+) -> std::result::Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
+    let vcpu_count = u8::try_from(microvm_state.vcpu_states.len()).map_err(|_| {
+        BuildMicrovmFromSnapshotError::TooManyVCPUs(microvm_state.vcpu_states.len())
+    })?;
 
     // Build Vmm.
     let (mut vmm, vcpus) = create_vmm_and_vcpus(
+        instance_info,
         event_manager,
         guest_memory.clone(),
+        uffd,
         track_dirty_pages,
         vcpu_count,
     )?;
 
+    #[cfg(target_arch = "x86_64")]
+    // Check if we need to scale the TSC.
+    // We start by checking if the CPU model in the snapshot is
+    // the same as this host's. If they are the same, we don't
+    // need to do anything else.
+    if !is_same_model(&microvm_state.vcpu_states[0].cpuid) {
+        // Extract the TSC freq from the state.
+        // No TSC freq in snapshot means we have to fail-fast.
+        let state_tsc = microvm_state.vcpu_states[0]
+            .tsc_khz
+            .ok_or(BuildMicrovmFromSnapshotError::TscFrequencyNotPresent)?;
+
+        // Scale the TSC frequency for all VCPUs, if needed.
+        if vcpus[0].kvm_vcpu.is_tsc_scaling_required(state_tsc)? {
+            for vcpu in &vcpus {
+                vcpu.kvm_vcpu.set_tsc_khz(state_tsc)?;
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mpidrs = construct_kvm_mpidrs(&microvm_state.vcpu_states);
+        // Restore kvm vm state.
+        vmm.vm.restore_state(&mpidrs, &microvm_state.vm_state)?;
+    }
+
     // Restore kvm vm state.
-    vmm.vm
-        .restore_state(&microvm_state.vm_state)
-        .map_err(MicrovmStateError::RestoreVmState)
-        .map_err(RestoreMicrovmState)?;
+    #[cfg(target_arch = "x86_64")]
+    vmm.vm.restore_state(&microvm_state.vm_state)?;
+
+    vm_resources.update_vm_config(&VmUpdateConfig {
+        vcpu_count: Some(vcpu_count),
+        mem_size_mib: Some(microvm_state.vm_info.mem_size_mib as usize),
+        smt: Some(microvm_state.vm_info.smt),
+        cpu_template: Some(microvm_state.vm_info.cpu_template),
+        track_dirty_pages: Some(track_dirty_pages),
+    })?;
+
+    // Restore the boot source config paths.
+    vm_resources.set_boot_source_config(microvm_state.vm_info.boot_source);
 
     // Restore devices states.
     let mmio_ctor_args = MMIODevManagerConstructorArgs {
         mem: guest_memory,
         vm: vmm.vm.fd(),
         event_manager,
+        for_each_restored_device: VmResources::update_from_restored_device,
+        vm_resources,
+        instance_id: &instance_info.id,
     };
+
     vmm.mmio_device_manager =
         MMIODeviceManager::restore(mmio_ctor_args, &microvm_state.device_states)
-            .map_err(MicrovmStateError::RestoreDevices)
-            .map_err(RestoreMicrovmState)?;
+            .map_err(MicrovmStateError::RestoreDevices)?;
+    vmm.emulate_serial_init()?;
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
-    vmm.start_vcpus(vcpus, seccomp_filter)
-        .map_err(StartMicrovmError::Internal)?;
+    vmm.start_vcpus(
+        vcpus,
+        seccomp_filters
+            .get("vcpu")
+            .ok_or(BuildMicrovmFromSnapshotError::MissingVcpuSeccompFilters)?
+            .clone(),
+    )?;
 
     // Restore vcpus kvm state.
-    vmm.restore_vcpu_states(microvm_state.vcpu_states)
-        .map_err(RestoreMicrovmState)?;
+    vmm.restore_vcpu_states(microvm_state.vcpu_states)?;
 
     let vmm = Arc::new(Mutex::new(vmm));
-    event_manager
-        .add_subscriber(vmm.clone())
-        .map_err(StartMicrovmError::RegisterEvent)?;
+    event_manager.add_subscriber(vmm.clone());
 
     // Load seccomp filters for the VMM thread.
     // Keep this as the last step of the building process.
-    SeccompFilter::apply(seccomp_filter.to_vec())
-        .map_err(Error::SeccompFilters)
-        .map_err(StartMicrovmError::Internal)?;
+    seccompiler::apply_filter(
+        seccomp_filters
+            .get("vmm")
+            .ok_or(BuildMicrovmFromSnapshotError::MissingVmmSeccompFilters)?,
+    )?;
 
     Ok(vmm)
 }
@@ -432,12 +618,19 @@ pub fn build_microvm_from_snapshot(
 /// Creates GuestMemory of `mem_size_mib` MiB in size.
 pub fn create_guest_memory(
     mem_size_mib: usize,
+    track_dirty_pages: bool,
 ) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
     let mem_size = mem_size_mib << 20;
     let arch_mem_regions = arch::arch_memory_regions(mem_size);
 
-    Ok(GuestMemoryMmap::from_ranges(&arch_mem_regions)
-        .map_err(StartMicrovmError::GuestMemoryMmap)?)
+    vm_memory::create_guest_memory(
+        &arch_mem_regions
+            .iter()
+            .map(|(addr, size)| (None, *addr, *size))
+            .collect::<Vec<_>>()[..],
+        track_dirty_pages,
+    )
+    .map_err(StartMicrovmError::GuestMemoryMmap)
 }
 
 fn load_kernel(
@@ -447,13 +640,27 @@ fn load_kernel(
     let mut kernel_file = boot_config
         .kernel_file
         .try_clone()
-        .map_err(|e| StartMicrovmError::Internal(Error::KernelFile(e)))?;
+        .map_err(|err| StartMicrovmError::Internal(Error::KernelFile(err)))?;
 
-    let entry_addr =
-        kernel::loader::load_kernel(guest_memory, &mut kernel_file, arch::get_kernel_start())
-            .map_err(StartMicrovmError::KernelLoader)?;
+    #[cfg(target_arch = "x86_64")]
+    let entry_addr = Loader::load::<std::fs::File, GuestMemoryMmap>(
+        guest_memory,
+        None,
+        &mut kernel_file,
+        Some(GuestAddress(arch::get_kernel_start())),
+    )
+    .map_err(StartMicrovmError::KernelLoader)?;
 
-    Ok(entry_addr)
+    #[cfg(target_arch = "aarch64")]
+    let entry_addr = Loader::load::<std::fs::File, GuestMemoryMmap>(
+        guest_memory,
+        Some(GuestAddress(arch::get_kernel_start())),
+        &mut kernel_file,
+        None,
+    )
+    .map_err(StartMicrovmError::KernelLoader)?;
+
+    Ok(entry_addr.kernel_load)
 }
 
 fn load_initrd_from_config(
@@ -489,7 +696,7 @@ where
     let size: usize;
     // Get the image size
     match image.seek(SeekFrom::End(0)) {
-        Err(e) => return Err(InitrdRead(e)),
+        Err(err) => return Err(InitrdRead(err)),
         Ok(0) => {
             return Err(InitrdRead(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -524,7 +731,7 @@ pub(crate) fn setup_kvm_vm(
         .map_err(Error::KvmContext)
         .map_err(Internal)?;
     let mut vm = Vm::new(kvm.fd()).map_err(Error::Vm).map_err(Internal)?;
-    vm.memory_init(&guest_memory, kvm.max_memslots(), track_dirty_pages)
+    vm.memory_init(guest_memory, kvm.max_memslots(), track_dirty_pages)
         .map_err(Error::Vm)
         .map_err(Internal)?;
     Ok(vm)
@@ -552,26 +759,38 @@ pub fn setup_interrupt_controller(
 /// Sets up the serial device.
 pub fn setup_serial_device(
     event_manager: &mut EventManager,
-    input: Box<dyn devices::legacy::ReadableFd + Send>,
+    input: Box<dyn ReadableFd + Send>,
     out: Box<dyn io::Write + Send>,
-) -> super::Result<Arc<Mutex<Serial>>> {
-    let interrupt_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(Error::EventFd)?;
-    let serial = Arc::new(Mutex::new(Serial::new_in_out(interrupt_evt, input, out)));
-    if let Err(e) = event_manager.add_subscriber(serial.clone()) {
-        // TODO: We just log this message, and immediately return Ok, instead of returning the
-        // actual error because this operation always fails with EPERM when adding a fd which
-        // has been redirected to /dev/null via dup2 (this may happen inside the jailer).
-        // Find a better solution to this (and think about the state of the serial device
-        // while we're at it).
-        warn!("Could not add serial input event to epoll: {:?}", e);
-    }
+) -> super::Result<Arc<Mutex<SerialDevice>>> {
+    let interrupt_evt = EventFdTrigger::new(EventFd::new(EFD_NONBLOCK).map_err(Error::EventFd)?);
+    let kick_stdin_read_evt =
+        EventFdTrigger::new(EventFd::new(EFD_NONBLOCK).map_err(Error::EventFd)?);
+    let serial = Arc::new(Mutex::new(SerialWrapper {
+        serial: Serial::with_events(
+            interrupt_evt,
+            SerialEventsWrapper {
+                metrics: METRICS.uart.clone(),
+                buffer_ready_event_fd: Some(kick_stdin_read_evt),
+            },
+            out,
+        ),
+        input: Some(input),
+    }));
+    event_manager.add_subscriber(serial.clone());
     Ok(serial)
+}
+
+#[cfg(target_arch = "aarch64")]
+/// Sets up the RTC device.
+pub fn setup_rtc_device() -> Arc<Mutex<RTCDevice>> {
+    let rtc = Rtc::with_events(METRICS.rtc.clone());
+    Arc::new(Mutex::new(rtc))
 }
 
 #[cfg(target_arch = "x86_64")]
 fn create_pio_dev_manager_with_legacy_devices(
     vm: &Vm,
-    serial: Arc<Mutex<devices::legacy::Serial>>,
+    serial: Arc<Mutex<SerialDevice>>,
     i8042_reset_evfd: EventFd,
 ) -> std::result::Result<PortIODeviceManager, super::Error> {
     let mut pio_dev_mgr =
@@ -586,25 +805,28 @@ fn create_pio_dev_manager_with_legacy_devices(
 fn attach_legacy_devices_aarch64(
     event_manager: &mut EventManager,
     vmm: &mut Vmm,
-    cmdline: &mut KernelCmdline,
+    cmdline: &mut LoaderKernelCmdline,
 ) -> super::Result<()> {
     // Serial device setup.
     if cmdline.as_str().contains("console=") {
+        // Make stdout non-blocking.
+        set_stdout_nonblocking();
         let serial = setup_serial_device(
             event_manager,
             Box::new(SerialStdin::get()),
             Box::new(io::stdout()),
         )?;
         vmm.mmio_device_manager
-            .register_mmio_serial(vmm.vm.fd(), serial)
+            .register_mmio_serial(vmm.vm.fd(), serial, None)
             .map_err(Error::RegisterMMIODevice)?;
         vmm.mmio_device_manager
             .add_mmio_serial_to_cmdline(cmdline)
             .map_err(Error::RegisterMMIODevice)?;
     }
 
+    let rtc = setup_rtc_device();
     vmm.mmio_device_manager
-        .register_new_mmio_rtc(vmm.vm.fd())
+        .register_mmio_rtc(rtc, None)
         .map_err(Error::RegisterMMIODevice)
 }
 
@@ -614,6 +836,8 @@ fn create_vcpus(vm: &Vm, vcpu_count: u8, exit_evt: &EventFd) -> super::Result<Ve
         let exit_evt = exit_evt.try_clone().map_err(Error::EventFd)?;
 
         let vcpu = Vcpu::new(cpu_idx, vm, exit_evt).map_err(Error::VcpuCreate)?;
+        #[cfg(target_arch = "aarch64")]
+        vcpu.kvm_vcpu.init(vm.fd()).map_err(Error::VcpuInit)?;
 
         vcpus.push(vcpu);
     }
@@ -628,7 +852,7 @@ pub fn configure_system_for_boot(
     vcpu_config: VcpuConfig,
     entry_addr: GuestAddress,
     initrd: &Option<InitrdConfig>,
-    boot_cmdline: KernelCmdline,
+    boot_cmdline: LoaderKernelCmdline,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
     #[cfg(target_arch = "x86_64")]
@@ -647,16 +871,16 @@ pub fn configure_system_for_boot(
 
         // Write the kernel command line to guest memory. This is x86_64 specific, since on
         // aarch64 the command line will be specified through the FDT.
-        kernel::loader::load_cmdline(
+        linux_loader::loader::load_cmdline::<vm_memory::GuestMemoryMmap>(
             vmm.guest_memory(),
             GuestAddress(arch::x86_64::layout::CMDLINE_START),
-            &boot_cmdline.as_cstring().map_err(LoadCommandline)?,
+            &boot_cmdline,
         )
         .map_err(LoadCommandline)?;
         arch::x86_64::configure_system(
             &vmm.guest_memory,
             vm_memory::GuestAddress(arch::x86_64::layout::CMDLINE_START),
-            boot_cmdline.len() + 1,
+            boot_cmdline.as_str().len() + 1,
             initrd,
             vcpus.len() as u8,
         )
@@ -666,7 +890,7 @@ pub fn configure_system_for_boot(
     {
         for vcpu in vcpus.iter_mut() {
             vcpu.kvm_vcpu
-                .configure(vmm.vm.fd(), vmm.guest_memory(), entry_addr)
+                .configure(vmm.guest_memory(), entry_addr)
                 .map_err(Error::VcpuConfigure)
                 .map_err(Internal)?;
         }
@@ -677,7 +901,7 @@ pub fn configure_system_for_boot(
             .collect();
         arch::aarch64::configure_system(
             &vmm.guest_memory,
-            &boot_cmdline.as_cstring().map_err(LoadCommandline)?,
+            boot_cmdline.as_str(),
             vcpu_mpidr,
             vmm.mmio_device_manager.get_device_info(),
             vmm.vm.get_irqchip(),
@@ -689,23 +913,21 @@ pub fn configure_system_for_boot(
 }
 
 /// Attaches a VirtioDevice device to the device manager and event manager.
-fn attach_virtio_device<T: 'static + VirtioDevice + Subscriber>(
+fn attach_virtio_device<T: 'static + VirtioDevice + MutEventSubscriber>(
     event_manager: &mut EventManager,
     vmm: &mut Vmm,
     id: String,
     device: Arc<Mutex<T>>,
-    cmdline: &mut KernelCmdline,
+    cmdline: &mut LoaderKernelCmdline,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
-    event_manager
-        .add_subscriber(device.clone())
-        .map_err(RegisterEvent)?;
+    event_manager.add_subscriber(device.clone());
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     let device = MmioTransport::new(vmm.guest_memory().clone(), device);
     vmm.mmio_device_manager
-        .register_new_virtio_mmio_device(vmm.vm.fd(), id, device, cmdline)
+        .register_mmio_virtio_for_boot(vmm.vm.fd(), id, device, cmdline)
         .map_err(RegisterMmioDevice)
         .map(|_| ())
 }
@@ -719,7 +941,7 @@ pub(crate) fn attach_boot_timer_device(
     let boot_timer = devices::pseudo::BootTimer::new(request_ts);
 
     vmm.mmio_device_manager
-        .register_new_mmio_boot_timer(boot_timer)
+        .register_mmio_boot_timer(boot_timer)
         .map_err(RegisterMmioDevice)?;
 
     Ok(())
@@ -727,7 +949,7 @@ pub(crate) fn attach_boot_timer_device(
 
 fn attach_block_devices<'a>(
     vmm: &mut Vmm,
-    cmdline: &mut KernelCmdline,
+    cmdline: &mut LoaderKernelCmdline,
     blocks: impl Iterator<Item = &'a Arc<Mutex<Block>>>,
     event_manager: &mut EventManager,
 ) -> std::result::Result<(), StartMicrovmError> {
@@ -755,7 +977,7 @@ fn attach_block_devices<'a>(
 
 fn attach_net_devices<'a>(
     vmm: &mut Vmm,
-    cmdline: &mut KernelCmdline,
+    cmdline: &mut LoaderKernelCmdline,
     net_devices: impl Iterator<Item = &'a Arc<Mutex<Net>>>,
     event_manager: &mut EventManager,
 ) -> std::result::Result<(), StartMicrovmError> {
@@ -769,7 +991,7 @@ fn attach_net_devices<'a>(
 
 fn attach_unixsock_vsock_device(
     vmm: &mut Vmm,
-    cmdline: &mut KernelCmdline,
+    cmdline: &mut LoaderKernelCmdline,
     unix_vsock: &Arc<Mutex<Vsock<VsockUnixBackend>>>,
     event_manager: &mut EventManager,
 ) -> std::result::Result<(), StartMicrovmError> {
@@ -778,27 +1000,56 @@ fn attach_unixsock_vsock_device(
     attach_virtio_device(event_manager, vmm, id, unix_vsock.clone(), cmdline)
 }
 
+fn attach_balloon_device(
+    vmm: &mut Vmm,
+    cmdline: &mut LoaderKernelCmdline,
+    balloon: &Arc<Mutex<Balloon>>,
+    event_manager: &mut EventManager,
+) -> std::result::Result<(), StartMicrovmError> {
+    let id = String::from(balloon.lock().expect("Poisoned lock").id());
+    // The device mutex mustn't be locked here otherwise it will deadlock.
+    attach_virtio_device(event_manager, vmm, id, balloon.clone(), cmdline)
+}
+
+// Adds `O_NONBLOCK` to the stdout flags.
+pub(crate) fn set_stdout_nonblocking() {
+    let flags = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFL, 0) };
+    if flags < 0 {
+        error!("Could not get Firecracker stdout flags.");
+    }
+    let rc = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if rc < 0 {
+        error!("Could not set Firecracker stdout to non-blocking.");
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use std::io::Cursor;
 
+    use arch::DeviceType;
+    use devices::virtio::vsock::VSOCK_DEV_ID;
+    use devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_VSOCK};
+    use linux_loader::cmdline::Cmdline;
+    use mmds::data_store::{Mmds, MmdsVersion};
+    use mmds::ns::MmdsNetworkStack;
+    use utils::tempfile::TempFile;
+    use vm_memory::GuestMemory;
+
     use super::*;
+    use crate::vmm_config::balloon::{BalloonBuilder, BalloonDeviceConfig, BALLOON_DEV_ID};
     use crate::vmm_config::boot_source::DEFAULT_KERNEL_CMDLINE;
-    use crate::vmm_config::drive::{BlockBuilder, BlockDeviceConfig};
+    use crate::vmm_config::drive::{BlockBuilder, BlockDeviceConfig, CacheType, FileEngineType};
     use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig};
     use crate::vmm_config::vsock::tests::default_config;
     use crate::vmm_config::vsock::{VsockBuilder, VsockDeviceConfig};
-    use arch::DeviceType;
-    use devices::virtio::{TYPE_BLOCK, TYPE_VSOCK};
-    use kernel::cmdline::Cmdline;
-    use polly::event_manager::EventManager;
-    use utils::tempfile::TempFile;
 
     pub(crate) struct CustomBlockConfig {
         drive_id: String,
         is_root_device: bool,
         partuuid: Option<String>,
         is_read_only: bool,
+        cache_type: CacheType,
     }
 
     impl CustomBlockConfig {
@@ -807,68 +1058,88 @@ pub mod tests {
             is_root_device: bool,
             partuuid: Option<String>,
             is_read_only: bool,
+            cache_type: CacheType,
         ) -> Self {
             CustomBlockConfig {
                 drive_id,
                 is_root_device,
                 partuuid,
                 is_read_only,
+                cache_type,
             }
         }
     }
 
     fn default_mmio_device_manager() -> MMIODeviceManager {
-        MMIODeviceManager::new(arch::MMIO_MEM_START, (arch::IRQ_BASE, arch::IRQ_MAX))
+        MMIODeviceManager::new(
+            arch::MMIO_MEM_START,
+            arch::MMIO_MEM_SIZE,
+            (arch::IRQ_BASE, arch::IRQ_MAX),
+        )
+        .unwrap()
     }
 
     #[cfg(target_arch = "x86_64")]
     fn default_portio_device_manager() -> PortIODeviceManager {
         PortIODeviceManager::new(
-            Arc::new(Mutex::new(Serial::new_sink(
-                EventFd::new(libc::EFD_NONBLOCK).unwrap(),
-            ))),
+            Arc::new(Mutex::new(SerialWrapper {
+                serial: Serial::with_events(
+                    EventFdTrigger::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+                    SerialEventsWrapper {
+                        metrics: METRICS.uart.clone(),
+                        buffer_ready_event_fd: None,
+                    },
+                    Box::new(std::io::sink()),
+                ),
+                input: None,
+            })),
             EventFd::new(libc::EFD_NONBLOCK).unwrap(),
         )
         .unwrap()
     }
 
     pub(crate) fn default_kernel_cmdline() -> Cmdline {
-        let mut kernel_cmdline = kernel::cmdline::Cmdline::new(4096);
-        kernel_cmdline.insert_str(DEFAULT_KERNEL_CMDLINE).unwrap();
-        kernel_cmdline
+        let mut boot_cmdline = linux_loader::cmdline::Cmdline::new(arch::CMDLINE_MAX_SIZE);
+        boot_cmdline.insert_str(DEFAULT_KERNEL_CMDLINE).unwrap();
+        boot_cmdline
     }
 
     pub(crate) fn default_vmm() -> Vmm {
-        let guest_memory = create_guest_memory(128).unwrap();
+        let guest_memory = create_guest_memory(128, false).unwrap();
 
-        let exit_evt = EventFd::new(libc::EFD_NONBLOCK)
+        let vcpus_exit_evt = EventFd::new(libc::EFD_NONBLOCK)
             .map_err(Error::EventFd)
             .map_err(StartMicrovmError::Internal)
             .unwrap();
 
-        let vm = setup_kvm_vm(&guest_memory, false).unwrap();
+        let mut vm = setup_kvm_vm(&guest_memory, false).unwrap();
         let mmio_device_manager = default_mmio_device_manager();
         #[cfg(target_arch = "x86_64")]
         let pio_device_manager = default_portio_device_manager();
 
-        let mut vmm = Vmm {
+        #[cfg(target_arch = "x86_64")]
+        setup_interrupt_controller(&mut vm).unwrap();
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let exit_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+            let _vcpu = Vcpu::new(1, &vm, exit_evt).unwrap();
+            setup_interrupt_controller(&mut vm, 1).unwrap();
+        }
+
+        Vmm {
             events_observer: Some(Box::new(SerialStdin::get())),
-            guest_memory,
-            vcpus_handles: Vec::new(),
-            exit_evt,
+            instance_info: InstanceInfo::default(),
+            shutdown_exit_code: None,
             vm,
+            guest_memory,
+            uffd: None,
+            vcpus_handles: Vec::new(),
+            vcpus_exit_evt,
             mmio_device_manager,
             #[cfg(target_arch = "x86_64")]
             pio_device_manager,
-        };
-
-        #[cfg(target_arch = "x86_64")]
-        setup_interrupt_controller(&mut vmm.vm).unwrap();
-
-        #[cfg(target_arch = "aarch64")]
-        setup_interrupt_controller(&mut vmm.vm, 1).unwrap();
-
-        vmm
+        }
     }
 
     pub(crate) fn insert_block_devices(
@@ -893,7 +1164,9 @@ pub mod tests {
                 is_root_device: custom_block_cfg.is_root_device,
                 partuuid: custom_block_cfg.partuuid.clone(),
                 is_read_only: custom_block_cfg.is_read_only,
+                cache_type: custom_block_cfg.cache_type,
                 rate_limiter: None,
+                file_engine_type: FileEngineType::default(),
             };
             block_dev_configs.insert(block_device_config).unwrap();
         }
@@ -915,13 +1188,33 @@ pub mod tests {
         assert!(res.is_ok());
     }
 
+    pub(crate) fn insert_net_device_with_mmds(
+        vmm: &mut Vmm,
+        cmdline: &mut Cmdline,
+        event_manager: &mut EventManager,
+        net_config: NetworkInterfaceConfig,
+        mmds_version: MmdsVersion,
+    ) {
+        let mut net_builder = NetBuilder::new();
+        net_builder.build(net_config).unwrap();
+        let net = net_builder.iter().next().unwrap();
+        let mut mmds = Mmds::default();
+        mmds.set_version(mmds_version).unwrap();
+        net.lock().unwrap().configure_mmds_network_stack(
+            MmdsNetworkStack::default_ipv4_addr(),
+            Arc::new(Mutex::new(mmds)),
+        );
+
+        attach_net_devices(vmm, cmdline, net_builder.iter(), event_manager).unwrap();
+    }
+
     pub(crate) fn insert_vsock_device(
         vmm: &mut Vmm,
         cmdline: &mut Cmdline,
         event_manager: &mut EventManager,
         vsock_config: VsockDeviceConfig,
     ) {
-        let vsock_dev_id = vsock_config.vsock_id.clone();
+        let vsock_dev_id = VSOCK_DEV_ID.to_owned();
         let vsock = VsockBuilder::create_unixsock_vsock(vsock_config).unwrap();
         let vsock = Arc::new(Mutex::new(vsock));
 
@@ -933,6 +1226,24 @@ pub mod tests {
             .is_some());
     }
 
+    pub(crate) fn insert_balloon_device(
+        vmm: &mut Vmm,
+        cmdline: &mut Cmdline,
+        event_manager: &mut EventManager,
+        balloon_config: BalloonDeviceConfig,
+    ) {
+        let mut builder = BalloonBuilder::new();
+        assert!(builder.set(balloon_config).is_ok());
+        let balloon = builder.get().unwrap();
+
+        assert!(attach_balloon_device(vmm, cmdline, balloon, event_manager).is_ok());
+
+        assert!(vmm
+            .mmio_device_manager
+            .get_device(DeviceType::Virtio(TYPE_BALLOON), BALLOON_DEV_ID)
+            .is_some());
+    }
+
     fn make_test_bin() -> Vec<u8> {
         let mut fake_bin = Vec::new();
         fake_bin.resize(1_000_000, 0xAA);
@@ -940,11 +1251,15 @@ pub mod tests {
     }
 
     fn create_guest_mem_at(at: GuestAddress, size: usize) -> GuestMemoryMmap {
-        GuestMemoryMmap::from_ranges(&[(at, size)]).unwrap()
+        vm_memory::test_utils::create_guest_memory_unguarded(&[(at, size)], false).unwrap()
     }
 
     pub(crate) fn create_guest_mem_with_size(size: usize) -> GuestMemoryMmap {
         create_guest_mem_at(GuestAddress(0x0), size)
+    }
+
+    fn is_dirty_tracking_enabled(mem: &GuestMemoryMmap) -> bool {
+        mem.iter().all(|r| r.bitmap().is_some())
     }
 
     #[test]
@@ -1000,9 +1315,26 @@ pub mod tests {
     }
 
     #[test]
+    fn test_create_guest_memory() {
+        let mem_size = 4096 * 2;
+
+        // Case 1: create guest memory without dirty page tracking
+        {
+            let guest_memory = create_guest_memory(mem_size, false).unwrap();
+            assert!(!is_dirty_tracking_enabled(&guest_memory));
+        }
+
+        // Case 2: create guest memory with dirty page tracking
+        {
+            let guest_memory = create_guest_memory(mem_size, true).unwrap();
+            assert!(is_dirty_tracking_enabled(&guest_memory));
+        }
+    }
+
+    #[test]
     fn test_create_vcpus() {
         let vcpu_count = 2;
-        let guest_memory = create_guest_memory(128).unwrap();
+        let guest_memory = create_guest_memory(128, false).unwrap();
 
         #[allow(unused_mut)]
         let mut vm = setup_kvm_vm(&guest_memory, false).unwrap();
@@ -1026,7 +1358,6 @@ pub mod tests {
             guest_mac: None,
             rx_rate_limiter: None,
             tx_rate_limiter: None,
-            allow_mmds_requests: true,
         };
 
         let mut cmdline = default_kernel_cmdline();
@@ -1049,7 +1380,13 @@ pub mod tests {
         // Use case 1: root block device is not specified through PARTUUID.
         {
             let drive_id = String::from("root");
-            let block_configs = vec![CustomBlockConfig::new(drive_id.clone(), true, None, true)];
+            let block_configs = vec![CustomBlockConfig::new(
+                drive_id.clone(),
+                true,
+                None,
+                true,
+                CacheType::Unsafe,
+            )];
             let mut vmm = default_vmm();
             let mut cmdline = default_kernel_cmdline();
             insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
@@ -1068,6 +1405,7 @@ pub mod tests {
                 true,
                 Some("0eaa91a0-01".to_string()),
                 false,
+                CacheType::Unsafe,
             )];
             let mut vmm = default_vmm();
             let mut cmdline = default_kernel_cmdline();
@@ -1087,6 +1425,7 @@ pub mod tests {
                 false,
                 Some("0eaa91a0-01".to_string()),
                 false,
+                CacheType::Unsafe,
             )];
             let mut vmm = default_vmm();
             let mut cmdline = default_kernel_cmdline();
@@ -1107,9 +1446,22 @@ pub mod tests {
                     true,
                     Some("0eaa91a0-01".to_string()),
                     false,
+                    CacheType::Unsafe,
                 ),
-                CustomBlockConfig::new(String::from("secondary"), false, None, true),
-                CustomBlockConfig::new(String::from("third"), false, None, false),
+                CustomBlockConfig::new(
+                    String::from("secondary"),
+                    false,
+                    None,
+                    true,
+                    CacheType::Unsafe,
+                ),
+                CustomBlockConfig::new(
+                    String::from("third"),
+                    false,
+                    None,
+                    false,
+                    CacheType::Unsafe,
+                ),
             ];
             let mut vmm = default_vmm();
             let mut cmdline = default_kernel_cmdline();
@@ -1131,15 +1483,22 @@ pub mod tests {
 
             // Check if these three block devices are inserted in kernel_cmdline.
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            assert!(cmdline
-                .as_str()
-                .contains("virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6 virtio_mmio.device=4K@0xd0002000:7"));
+            assert!(cmdline.as_str().contains(
+                "virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6 \
+                 virtio_mmio.device=4K@0xd0002000:7"
+            ));
         }
 
         // Use case 5: root block device is rw.
         {
             let drive_id = String::from("root");
-            let block_configs = vec![CustomBlockConfig::new(drive_id.clone(), true, None, false)];
+            let block_configs = vec![CustomBlockConfig::new(
+                drive_id.clone(),
+                true,
+                None,
+                false,
+                CacheType::Unsafe,
+            )];
             let mut vmm = default_vmm();
             let mut cmdline = default_kernel_cmdline();
             insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
@@ -1158,11 +1517,32 @@ pub mod tests {
                 true,
                 Some("0eaa91a0-01".to_string()),
                 true,
+                CacheType::Unsafe,
             )];
             let mut vmm = default_vmm();
             let mut cmdline = default_kernel_cmdline();
             insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
             assert!(cmdline.as_str().contains("root=PARTUUID=0eaa91a0-01 ro"));
+            assert!(vmm
+                .mmio_device_manager
+                .get_device(DeviceType::Virtio(TYPE_BLOCK), drive_id.as_str())
+                .is_some());
+        }
+
+        // Use case 7: root block device is rw with flush enabled
+        {
+            let drive_id = String::from("root");
+            let block_configs = vec![CustomBlockConfig::new(
+                drive_id.clone(),
+                true,
+                None,
+                false,
+                CacheType::Writeback,
+            )];
+            let mut vmm = default_vmm();
+            let mut cmdline = default_kernel_cmdline();
+            insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
+            assert!(cmdline.as_str().contains("root=/dev/vda rw"));
             assert!(vmm
                 .mmio_device_manager
                 .get_device(DeviceType::Virtio(TYPE_BLOCK), drive_id.as_str())
@@ -1181,6 +1561,26 @@ pub mod tests {
             .mmio_device_manager
             .get_device(DeviceType::BootTimer, &DeviceType::BootTimer.to_string())
             .is_some());
+    }
+
+    #[test]
+    fn test_attach_balloon_device() {
+        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
+        let mut vmm = default_vmm();
+
+        let balloon_config = BalloonDeviceConfig {
+            amount_mib: 0,
+            deflate_on_oom: false,
+            stats_polling_interval_s: 0,
+        };
+
+        let mut cmdline = default_kernel_cmdline();
+        insert_balloon_device(&mut vmm, &mut cmdline, &mut event_manager, balloon_config);
+        // Check if the vsock device is described in kernel_cmdline.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        assert!(cmdline
+            .as_str()
+            .contains("virtio_mmio.device=4K@0xd0000000:5"));
     }
 
     #[test]
@@ -1221,13 +1621,9 @@ pub mod tests {
         let err = KernelCmdline(String::from("dummy --cmdline"));
         let _ = format!("{}{:?}", err, err);
 
-        let err = KernelLoader(kernel::loader::Error::InvalidElfMagicNumber);
+        let err = KernelLoader(linux_loader::loader::Error::InvalidKernelStartAddress);
         let _ = format!("{}{:?}", err, err);
-
-        let err = LoadCommandline(kernel::cmdline::Error::TooLarge);
-        let _ = format!("{}{:?}", err, err);
-
-        let err = MicroVMAlreadyRunning;
+        let err = LoadCommandline(linux_loader::loader::Error::CommandLineOverflow);
         let _ = format!("{}{:?}", err, err);
 
         let err = MissingKernelConfig;
@@ -1241,16 +1637,11 @@ pub mod tests {
 
         let err = OpenBlockDevice(io::Error::from_raw_os_error(0));
         let _ = format!("{}{:?}", err, err);
-
-        let err = RegisterEvent(EventManagerError::EpollCreate(
-            io::Error::from_raw_os_error(0),
-        ));
-        let _ = format!("{}{:?}", err, err);
     }
 
     #[test]
     fn test_kernel_cmdline_err_to_startuvm_err() {
-        let err = StartMicrovmError::from(kernel::cmdline::Error::HasSpace);
+        let err = StartMicrovmError::from(linux_loader::cmdline::Error::HasSpace);
         let _ = format!("{}{:?}", err, err);
     }
 }

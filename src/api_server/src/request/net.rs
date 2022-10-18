@@ -1,13 +1,17 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use logger::{IncMetric, METRICS};
+use vmm::vmm_config::net::{NetworkInterfaceConfig, NetworkInterfaceUpdateConfig};
+
 use super::super::VmmAction;
 use crate::parsed_request::{checked_id, Error, ParsedRequest};
 use crate::request::{Body, StatusCode};
-use logger::{Metric, METRICS};
-use vmm::vmm_config::net::{NetworkInterfaceConfig, NetworkInterfaceUpdateConfig};
 
-pub fn parse_put_net(body: &Body, id_from_path: Option<&&str>) -> Result<ParsedRequest, Error> {
+pub(crate) fn parse_put_net(
+    body: &Body,
+    id_from_path: Option<&&str>,
+) -> Result<ParsedRequest, Error> {
     METRICS.put_api_requests.network_count.inc();
     let id = if let Some(id) = id_from_path {
         checked_id(id)?
@@ -16,15 +20,19 @@ pub fn parse_put_net(body: &Body, id_from_path: Option<&&str>) -> Result<ParsedR
         return Err(Error::EmptyID);
     };
 
-    let netif = serde_json::from_slice::<NetworkInterfaceConfig>(body.raw()).map_err(|e| {
+    let netif = serde_json::from_slice::<NetworkInterfaceConfig>(body.raw()).map_err(|err| {
         METRICS.put_api_requests.network_fails.inc();
-        Error::SerdeJson(e)
+        err
     })?;
     if id != netif.iface_id.as_str() {
         METRICS.put_api_requests.network_fails.inc();
         return Err(Error::Generic(
             StatusCode::BadRequest,
-            "The id from the path does not match the id from the body!".to_string(),
+            format!(
+                "The id from the path [{}] does not match the id from the body [{}]!",
+                id,
+                netif.iface_id.as_str()
+            ),
         ));
     }
     Ok(ParsedRequest::new_sync(VmmAction::InsertNetworkDevice(
@@ -32,7 +40,10 @@ pub fn parse_put_net(body: &Body, id_from_path: Option<&&str>) -> Result<ParsedR
     )))
 }
 
-pub fn parse_patch_net(body: &Body, id_from_path: Option<&&str>) -> Result<ParsedRequest, Error> {
+pub(crate) fn parse_patch_net(
+    body: &Body,
+    id_from_path: Option<&&str>,
+) -> Result<ParsedRequest, Error> {
     METRICS.patch_api_requests.network_count.inc();
     let id = if let Some(id) = id_from_path {
         checked_id(id)?
@@ -42,15 +53,19 @@ pub fn parse_patch_net(body: &Body, id_from_path: Option<&&str>) -> Result<Parse
     };
 
     let netif =
-        serde_json::from_slice::<NetworkInterfaceUpdateConfig>(body.raw()).map_err(|e| {
+        serde_json::from_slice::<NetworkInterfaceUpdateConfig>(body.raw()).map_err(|err| {
             METRICS.patch_api_requests.network_fails.inc();
-            Error::SerdeJson(e)
+            err
         })?;
     if id != netif.iface_id {
         METRICS.patch_api_requests.network_count.inc();
         return Err(Error::Generic(
             StatusCode::BadRequest,
-            "The id from the path does not match the id from the body!".to_string(),
+            format!(
+                "The id from the path [{}] does not match the id from the body [{}]!",
+                id,
+                netif.iface_id.as_str()
+            ),
         ));
     }
     Ok(ParsedRequest::new_sync(VmmAction::UpdateNetworkInterface(
@@ -68,8 +83,7 @@ mod tests {
         let body = r#"{
                 "iface_id": "foo",
                 "host_dev_name": "bar",
-                "guest_mac": "12:34:56:78:9A:BC",
-                "allow_mmds_requests": false
+                "guest_mac": "12:34:56:78:9A:BC"
               }"#;
         // 1. Exercise infamous "The id from the path does not match id from the body!".
         assert!(parse_put_net(&Body::new(body), Some(&"bar")).is_err());

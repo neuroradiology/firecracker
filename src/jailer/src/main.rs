@@ -1,250 +1,158 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
+
+use std::ffi::{CString, NulError, OsString};
+use std::fmt::{Debug, Display};
+use std::path::{Path, PathBuf};
+use std::{env as p_env, fs, io};
+
+use env::PROC_MOUNTS;
+use utils::arg_parser::{ArgParser, Argument, UtilsArgParserError as ParsingError};
+use utils::time::{ClockType, get_time_us};
+use utils::validators;
+use vmm_sys_util::syscall::SyscallReturnCode;
+
+use crate::env::Env;
+
 mod cgroup;
 mod chroot;
 mod env;
 mod resource_limits;
-use std::ffi::{CString, NulError, OsString};
-use std::path::{Path, PathBuf};
-use std::{env as p_env, fmt, fs, io, process, result};
 
-use utils::arg_parser::{ArgParser, Argument, Error as ParsingError};
-use utils::validators;
+const JAILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-use crate::env::Env;
-
-const JAILER_VERSION: &str = env!("FIRECRACKER_VERSION");
-#[derive(Debug)]
-pub enum Error {
+#[derive(Debug, thiserror::Error)]
+pub enum JailerError {
+    #[error("Failed to parse arguments: {0}")]
     ArgumentParsing(ParsingError),
+    #[error("{}", format!("Failed to canonicalize path {:?}: {}", .0, .1).replace('\"', ""))]
     Canonicalize(PathBuf, io::Error),
+    #[error("{}", format!("Failed to inherit cgroups configurations from file {} in path {:?}", .1, .0).replace('\"', ""))]
     CgroupInheritFromParent(PathBuf, String),
+    #[error("{1} configurations not found in {0}")]
     CgroupLineNotFound(String, String),
+    #[error("Cgroup invalid file: {0}")]
     CgroupInvalidFile(String),
-    CgroupWrite(String, String, String),
+    #[error("Invalid format for cgroups: {0}")]
     CgroupFormat(String),
+    #[error("Hierarchy not found: {0}")]
     CgroupHierarchyMissing(String),
+    #[error("Controller {0} is unavailable")]
     CgroupControllerUnavailable(String),
+    #[error("{0} is an invalid cgroup version specifier")]
     CgroupInvalidVersion(String),
+    #[error("Parent cgroup path is invalid. Path should not be absolute or contain '..' or '.'")]
     CgroupInvalidParentPath(),
+    #[error(
+        "Failed to move process to cgroup ({0}): {1}.\nHint: If you intended to create a child \
+         cgroup under {0}, pass any --cgroup parameters."
+    )]
+    CgroupMove(PathBuf, io::Error),
+    #[error("Failed to change owner for {0}: {1}")]
     ChangeFileOwner(PathBuf, io::Error),
+    #[error("Failed to chdir into chroot directory: {0}")]
     ChdirNewRoot(io::Error),
+    #[error("Failed to change permissions on {0}: {1}")]
     Chmod(PathBuf, io::Error),
+    #[error("Failed cloning into a new child process: {0}")]
     Clone(io::Error),
+    #[error("Failed to close netns fd: {0}")]
     CloseNetNsFd(io::Error),
+    #[error("Failed to close /dev/null fd: {0}")]
     CloseDevNullFd(io::Error),
+    #[error("Failed to call close range syscall: {0}")]
+    CloseRange(io::Error),
+    #[error("{}", format!("Failed to copy {:?} to {:?}: {}", .0, .1, .2).replace('\"', ""))]
     Copy(PathBuf, PathBuf, io::Error),
+    #[error("{}", format!("Failed to create directory {:?}: {}", .0, .1).replace('\"', ""))]
     CreateDir(PathBuf, io::Error),
+    #[error("Encountered interior \\0 while parsing a string")]
     CStringParsing(NulError),
+    #[error("Failed to daemonize: {0}")]
+    Daemonize(io::Error),
+    #[error("Failed to open directory {0}: {1}")]
+    DirOpen(String, String),
+    #[error("Failed to duplicate fd: {0}")]
     Dup2(io::Error),
+    #[error("Failed to exec into Firecracker: {0}")]
     Exec(io::Error),
-    ExecFileName(String),
+    #[error("{}", format!("Failed to extract filename from path {:?}", .0).replace('\"', ""))]
     ExtractFileName(PathBuf),
+    #[error("{}", format!("Failed to open file {:?}: {}", .0, .1).replace('\"', ""))]
     FileOpen(PathBuf, io::Error),
+    #[error("Failed to decode string from byte array: {0}")]
     FromBytesWithNul(std::ffi::FromBytesWithNulError),
+    #[error("Failed to get flags from fd: {0}")]
     GetOldFdFlags(io::Error),
+    #[error("Failed to get PID (getpid): {0}")]
+    GetPid(io::Error),
+    #[error("Failed to get SID (getsid): {0}")]
+    GetSid(io::Error),
+    #[error("Invalid gid: {0}")]
     Gid(String),
-    InvalidInstanceId(validators::Error),
+    #[error("Detected hard link at: {0}")]
+    HardLink(PathBuf),
+    #[error("Invalid instance ID: {0}")]
+    InvalidInstanceId(validators::ValidatorError),
+    #[error("Cannot get metadata for a file: {0}: {1}")]
+    Metadata(PathBuf, io::Error),
+    #[error("{}", format!("File {:?} doesn't have a parent", .0).replace('\"', ""))]
     MissingParent(PathBuf),
+    #[error("Failed to create the jail root directory before pivoting root: {0}")]
     MkdirOldRoot(io::Error),
-    MknodDev(io::Error, &'static str),
+    #[error("Failed to create {1} via mknod inside the jail: {0}")]
+    MknodDev(io::Error, String),
+    #[error("Failed to bind mount the jail root directory: {0}")]
     MountBind(io::Error),
+    #[error("Failed to change the propagation type to slave: {0}")]
     MountPropagationSlave(io::Error),
+    #[error("{}", format!("{:?} is not a file", .0).replace('\"', ""))]
     NotAFile(PathBuf),
+    #[error("{}", format!("{:?} is not a directory", .0).replace('\"', ""))]
     NotADirectory(PathBuf),
-    OpenDevNull(io::Error),
+    #[error("Failed to open {0}: {1}")]
+    Open(PathBuf, io::Error),
+    #[error("{}", format!("Failed to parse path {:?} into an OsString", .0).replace('\"', ""))]
     OsStringParsing(PathBuf, OsString),
+    #[error("Failed to pivot root: {0}")]
     PivotRoot(io::Error),
+    #[error("{}", format!("Failed to read line from {:?}: {}", .0, .1).replace('\"', ""))]
     ReadLine(PathBuf, io::Error),
+    #[error("{}", format!("Failed to read file {:?} into a string: {}", .0, .1).replace('\"', ""))]
     ReadToString(PathBuf, io::Error),
+    #[error("Regex failed: {0}")]
     RegEx(regex::Error),
+    #[error("Invalid resource argument: {0}")]
     ResLimitArgument(String),
+    #[error("Invalid format for resources limits: {0}")]
     ResLimitFormat(String),
+    #[error("Invalid limit value for resource: {0}: {1}")]
     ResLimitValue(String, String),
+    #[error("Failed to remove old jail root directory: {0}")]
     RmOldRootDir(io::Error),
+    #[error("Failed to change current directory: {0}")]
     SetCurrentDir(io::Error),
+    #[error("Failed to join network namespace: netns: {0}")]
     SetNetNs(io::Error),
+    #[error("Failed to set limit for resource: {0}")]
     Setrlimit(String),
+    #[error("Failed to daemonize: setsid: {0}")]
     SetSid(io::Error),
+    #[error("Invalid uid: {0}")]
     Uid(String),
+    #[error("Failed to unmount the old jail root: {0}")]
     UmountOldRoot(io::Error),
+    #[error("Unexpected value for the socket listener fd: {0}")]
     UnexpectedListenerFd(i32),
+    #[error("Failed to unshare into new mount namespace: {0}")]
     UnshareNewNs(io::Error),
+    #[error("Failed to unset the O_CLOEXEC flag on the socket fd: {0}")]
     UnsetCloexec(io::Error),
+    #[error("Slice contains invalid UTF-8 data : {0}")]
+    UTF8Parsing(std::str::Utf8Error),
+    #[error("{}", format!("Failed to write to {:?}: {}", .0, .1).replace('\"', ""))]
     Write(PathBuf, io::Error),
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
-        match *self {
-            ArgumentParsing(ref err) => write!(f, "Failed to parse arguments: {}", err),
-            Canonicalize(ref path, ref io_err) => write!(
-                f,
-                "{}",
-                format!("Failed to canonicalize path {:?}: {}", path, io_err).replace('\"', "")
-            ),
-            Chmod(ref path, ref err) => {
-                write!(f, "Failed to change permissions on {:?}: {}", path, err)
-            }
-            CgroupInheritFromParent(ref path, ref filename) => write!(
-                f,
-                "{}",
-                format!(
-                    "Failed to inherit cgroups configurations from file {} in path {:?}",
-                    filename, path
-                )
-                .replace('\"', "")
-            ),
-            CgroupLineNotFound(ref proc_mounts, ref controller) => write!(
-                f,
-                "{} configurations not found in {}",
-                controller, proc_mounts
-            ),
-            CgroupInvalidFile(ref file) => write!(f, "Cgroup invalid file: {}", file,),
-            CgroupWrite(ref evalue, ref rvalue, ref file) => write!(
-                f,
-                "Expected value {} for {}. Current value: {}",
-                evalue, file, rvalue
-            ),
-            CgroupFormat(ref arg) => write!(f, "Invalid format for cgroups: {}", arg,),
-            CgroupHierarchyMissing(ref arg) => write!(f, "Hierarchy not found: {}", arg,),
-            CgroupControllerUnavailable(ref arg) => write!(f, "Controller {} is unavailable", arg,),
-            CgroupInvalidVersion(ref arg) => {
-                write!(f, "{} is an invalid cgroup version specifier", arg,)
-            }
-            CgroupInvalidParentPath() => {
-                write!(
-                    f,
-                    "Parent cgroup path is invalid. Path should not be absolute or contain '..' \
-                     or '.'",
-                )
-            }
-            ChangeFileOwner(ref path, ref err) => {
-                write!(f, "Failed to change owner for {:?}: {}", path, err)
-            }
-            ChdirNewRoot(ref err) => write!(f, "Failed to chdir into chroot directory: {}", err),
-            Clone(ref err) => write!(f, "Failed cloning into a new child process: {}", err),
-            CloseNetNsFd(ref err) => write!(f, "Failed to close netns fd: {}", err),
-            CloseDevNullFd(ref err) => write!(f, "Failed to close /dev/null fd: {}", err),
-            Copy(ref file, ref path, ref err) => write!(
-                f,
-                "{}",
-                format!("Failed to copy {:?} to {:?}: {}", file, path, err).replace('\"', "")
-            ),
-            CreateDir(ref path, ref err) => write!(
-                f,
-                "{}",
-                format!("Failed to create directory {:?}: {}", path, err).replace('\"', "")
-            ),
-            CStringParsing(_) => write!(f, "Encountered interior \\0 while parsing a string"),
-            Dup2(ref err) => write!(f, "Failed to duplicate fd: {}", err),
-            Exec(ref err) => write!(f, "Failed to exec into Firecracker: {}", err),
-            ExecFileName(ref filename) => write!(
-                f,
-                "Invalid filename. The filename of `--exec-file` option must contain \
-                 \"firecracker\": {}",
-                filename
-            ),
-            ExtractFileName(ref path) => write!(
-                f,
-                "{}",
-                format!("Failed to extract filename from path {:?}", path).replace('\"', "")
-            ),
-            FileOpen(ref path, ref err) => write!(
-                f,
-                "{}",
-                format!("Failed to open file {:?}: {}", path, err).replace('\"', "")
-            ),
-            FromBytesWithNul(ref err) => {
-                write!(f, "Failed to decode string from byte array: {}", err)
-            }
-            GetOldFdFlags(ref err) => write!(f, "Failed to get flags from fd: {}", err),
-            Gid(ref gid) => write!(f, "Invalid gid: {}", gid),
-            InvalidInstanceId(ref err) => write!(f, "Invalid instance ID: {}", err),
-            MissingParent(ref path) => write!(
-                f,
-                "{}",
-                format!("File {:?} doesn't have a parent", path).replace('\"', "")
-            ),
-            MkdirOldRoot(ref err) => write!(
-                f,
-                "Failed to create the jail root directory before pivoting root: {}",
-                err
-            ),
-            MknodDev(ref err, ref devname) => write!(
-                f,
-                "Failed to create {} via mknod inside the jail: {}",
-                devname, err
-            ),
-            MountBind(ref err) => {
-                write!(f, "Failed to bind mount the jail root directory: {}", err)
-            }
-            MountPropagationSlave(ref err) => {
-                write!(f, "Failed to change the propagation type to slave: {}", err)
-            }
-            NotAFile(ref path) => write!(
-                f,
-                "{}",
-                format!("{:?} is not a file", path).replace('\"', "")
-            ),
-            NotADirectory(ref path) => write!(
-                f,
-                "{}",
-                format!("{:?} is not a directory", path).replace('\"', "")
-            ),
-            OpenDevNull(ref err) => write!(f, "Failed to open /dev/null: {}", err),
-            OsStringParsing(ref path, _) => write!(
-                f,
-                "{}",
-                format!("Failed to parse path {:?} into an OsString", path).replace('\"', "")
-            ),
-            PivotRoot(ref err) => write!(f, "Failed to pivot root: {}", err),
-            ReadLine(ref path, ref err) => write!(
-                f,
-                "{}",
-                format!("Failed to read line from {:?}: {}", path, err).replace('\"', "")
-            ),
-            ReadToString(ref path, ref err) => write!(
-                f,
-                "{}",
-                format!("Failed to read file {:?} into a string: {}", path, err).replace('\"', "")
-            ),
-            RegEx(ref err) => write!(f, "Regex failed: {:?}", err),
-            ResLimitArgument(ref arg) => write!(f, "Invalid resource argument: {}", arg,),
-            ResLimitFormat(ref arg) => write!(f, "Invalid format for resources limits: {}", arg,),
-            ResLimitValue(ref arg, ref err) => {
-                write!(f, "Invalid limit value for resource: {}: {}", arg, err)
-            }
-            RmOldRootDir(ref err) => write!(f, "Failed to remove old jail root directory: {}", err),
-            SetCurrentDir(ref err) => write!(f, "Failed to change current directory: {}", err),
-            SetNetNs(ref err) => write!(f, "Failed to join network namespace: netns: {}", err),
-            Setrlimit(ref err) => write!(f, "Failed to set limit for resource: {}", err),
-            SetSid(ref err) => write!(f, "Failed to daemonize: setsid: {}", err),
-            Uid(ref uid) => write!(f, "Invalid uid: {}", uid),
-            UmountOldRoot(ref err) => write!(f, "Failed to unmount the old jail root: {}", err),
-            UnexpectedListenerFd(fd) => {
-                write!(f, "Unexpected value for the socket listener fd: {}", fd)
-            }
-            UnshareNewNs(ref err) => {
-                write!(f, "Failed to unshare into new mount namespace: {}", err)
-            }
-            UnsetCloexec(ref err) => write!(
-                f,
-                "Failed to unset the O_CLOEXEC flag on the socket fd: {}",
-                err
-            ),
-            Write(ref path, ref err) => write!(
-                f,
-                "{}",
-                format!("Failed to write to {:?}: {}", path, err).replace('\"', "")
-            ),
-        }
-    }
-}
-
-pub type Result<T> = result::Result<T, Error>;
 
 /// Create an ArgParser object which contains info about the command line argument parser and
 /// populate it with the expected arguments and their characteristics.
@@ -327,18 +235,18 @@ pub fn build_arg_parser() -> ArgParser<'static> {
 
 // It's called writeln_special because we have to use this rather convoluted way of writing
 // to special cgroup files, to avoid getting errors. It would be nice to know why that happens :-s
-pub fn writeln_special<T, V>(file_path: &T, value: V) -> Result<()>
+pub fn writeln_special<T, V>(file_path: &T, value: V) -> Result<(), JailerError>
 where
-    T: AsRef<Path>,
-    V: ::std::fmt::Display,
+    T: AsRef<Path> + Debug,
+    V: Display + Debug,
 {
     fs::write(file_path, format!("{}\n", value))
-        .map_err(|err| Error::Write(PathBuf::from(file_path.as_ref()), err))
+        .map_err(|err| JailerError::Write(PathBuf::from(file_path.as_ref()), err))
 }
 
-pub fn readln_special<T: AsRef<Path>>(file_path: &T) -> Result<String> {
+pub fn readln_special<T: AsRef<Path> + Debug>(file_path: &T) -> Result<String, JailerError> {
     let mut line = fs::read_to_string(file_path)
-        .map_err(|err| Error::ReadToString(PathBuf::from(file_path.as_ref()), err))?;
+        .map_err(|err| JailerError::ReadToString(PathBuf::from(file_path.as_ref()), err))?;
 
     // Remove the newline character at the end (if any).
     line.pop();
@@ -346,24 +254,36 @@ pub fn readln_special<T: AsRef<Path>>(file_path: &T) -> Result<String> {
     Ok(line)
 }
 
-fn sanitize_process() {
+fn close_fds_by_close_range() -> Result<(), JailerError> {
+    // First try using the close_range syscall to close all open FDs in the range of 3..UINT_MAX
+    // SAFETY: if the syscall is not available then ENOSYS will be returned
+    SyscallReturnCode(unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3,
+            libc::c_uint::MAX,
+            libc::CLOSE_RANGE_UNSHARE,
+        )
+    })
+    .into_empty_result()
+    .map_err(JailerError::CloseRange)
+}
+
+// Closes all FDs other than 0 (STDIN), 1 (STDOUT) and 2 (STDERR)
+fn close_inherited_fds() -> Result<(), JailerError> {
+    // We use the close_range syscall which is available on kernels > 5.9.
+    close_fds_by_close_range()?;
+    Ok(())
+}
+
+fn sanitize_process() -> Result<(), JailerError> {
     // First thing to do is make sure we don't keep any inherited FDs
     // other that IN, OUT and ERR.
-    if let Ok(mut paths) = fs::read_dir("/proc/self/fd") {
-        while let Some(Ok(path)) = paths.next() {
-            let file_name = path.file_name();
-            let fd_str = file_name.to_str().unwrap_or("0");
-            let fd = fd_str.parse::<i32>().unwrap_or(0);
+    close_inherited_fds()?;
 
-            if fd > 2 {
-                // Safe because close() cannot fail when passed a valid parameter.
-                unsafe { libc::close(fd) };
-            }
-        }
-    }
-
-    // Cleanup environment variables
+    // Cleanup environment variables.
     clean_env_vars();
+    Ok(())
 }
 
 fn clean_env_vars() {
@@ -371,98 +291,135 @@ fn clean_env_vars() {
     // the parent process so there are no leaks
     // inside the jailer environment
     for (key, _) in p_env::vars() {
-        p_env::remove_var(key);
+        // SAFETY: the function is safe to call in a single-threaded program
+        unsafe {
+            p_env::remove_var(key);
+        }
     }
 }
 
-/// Turns an AsRef<Path> into a CString (c style string).
+/// Turns an [`AsRef<Path>`] into a [`CString`] (c style string).
 /// The expect should not fail, since Linux paths only contain valid Unicode chars (do they?),
 /// and do not contain null bytes (do they?).
-pub fn to_cstring<T: AsRef<Path>>(path: T) -> Result<CString> {
+pub fn to_cstring<T: AsRef<Path> + Debug>(path: T) -> Result<CString, JailerError> {
     let path_str = path
         .as_ref()
         .to_path_buf()
         .into_os_string()
         .into_string()
-        .map_err(|err| Error::OsStringParsing(path.as_ref().to_path_buf(), err))?;
-    CString::new(path_str).map_err(Error::CStringParsing)
+        .map_err(|err| JailerError::OsStringParsing(path.as_ref().to_path_buf(), err))?;
+    CString::new(path_str).map_err(JailerError::CStringParsing)
 }
 
-fn main() {
-    sanitize_process();
+/// We wrap the actual main in order to pretty print an error with Display trait.
+fn main() -> Result<(), JailerError> {
+    let result = main_exec();
+    if let Err(e) = result {
+        eprintln!("{}", e);
+        Err(e)
+    } else {
+        Ok(())
+    }
+}
+
+fn main_exec() -> Result<(), JailerError> {
+    sanitize_process()
+        .unwrap_or_else(|err| panic!("Failed to sanitize the Jailer process: {}", err));
 
     let mut arg_parser = build_arg_parser();
+    arg_parser
+        .parse_from_cmdline()
+        .map_err(JailerError::ArgumentParsing)?;
+    let arguments = arg_parser.arguments();
 
-    match arg_parser.parse_from_cmdline() {
-        Err(err) => {
-            println!(
-                "Arguments parsing error: {} \n\nFor more information try --help.",
-                err
-            );
-            process::exit(1);
-        }
-        _ => {
-            if arg_parser.arguments().flag_present("help") {
-                println!("Jailer v{}\n", JAILER_VERSION);
-                println!("{}\n", arg_parser.formatted_help());
-                println!(
-                    "Any arguments after the -- separator will be supplied to the jailed binary.\n"
-                );
-                process::exit(0);
-            }
+    if arguments.flag_present("help") {
+        println!("Jailer v{}\n", JAILER_VERSION);
+        println!("{}\n", arg_parser.formatted_help());
+        println!("Any arguments after the -- separator will be supplied to the jailed binary.\n");
+        return Ok(());
+    }
 
-            if arg_parser.arguments().flag_present("version") {
-                println!("Jailer v{}\n", JAILER_VERSION);
-                process::exit(0);
-            }
-        }
+    if arguments.flag_present("version") {
+        println!("Jailer v{}\n", JAILER_VERSION);
+        return Ok(());
     }
 
     Env::new(
-        arg_parser.arguments(),
-        utils::time::get_time_us(utils::time::ClockType::Monotonic),
-        utils::time::get_time_us(utils::time::ClockType::ProcessCpu),
+        arguments,
+        get_time_us(ClockType::Monotonic),
+        get_time_us(ClockType::ProcessCpu),
+        PROC_MOUNTS,
     )
     .and_then(|env| {
         fs::create_dir_all(env.chroot_dir())
-            .map_err(|err| Error::CreateDir(env.chroot_dir().to_owned(), err))?;
+            .map_err(|err| JailerError::CreateDir(env.chroot_dir().to_owned(), err))?;
         env.run()
-    })
-    .unwrap_or_else(|err| panic!("Jailer error: {}", err));
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::undocumented_unsafe_blocks)]
+
     use std::env;
+    use std::ffi::CStr;
     use std::fs::File;
     use std::os::unix::io::IntoRawFd;
 
-    use utils::arg_parser;
+    use vmm_sys_util::rand;
 
     use super::*;
 
-    #[test]
-    fn test_sanitize_process() {
+    fn run_close_fds_test(test_fn: fn() -> Result<(), JailerError>) {
         let n = 100;
 
-        let tmp_dir_path = "/tmp/jailer/tests/sanitize_process";
-        assert!(fs::create_dir_all(tmp_dir_path).is_ok());
+        let tmp_dir_path = format!(
+            "/tmp/jailer/tests/close_fds/_{}",
+            rand::rand_alphanumerics(4).into_string().unwrap()
+        );
+        fs::create_dir_all(&tmp_dir_path).unwrap();
 
         let mut fds = Vec::new();
         for i in 0..n {
-            let maybe_file = File::create(format!("{}/{}", tmp_dir_path, i));
-            assert!(maybe_file.is_ok());
+            let maybe_file = File::create(format!("{}/{}", &tmp_dir_path, i));
             fds.push(maybe_file.unwrap().into_raw_fd());
         }
 
-        sanitize_process();
+        test_fn().unwrap();
 
         for fd in fds {
             let is_fd_opened = unsafe { libc::fcntl(fd, libc::F_GETFD) } == 0;
             assert!(!is_fd_opened);
         }
 
-        assert!(fs::remove_dir_all(tmp_dir_path).is_ok());
+        fs::remove_dir_all(tmp_dir_path).unwrap();
+    }
+
+    #[test]
+    fn test_fds_close_range() {
+        // SAFETY: Always safe
+        let mut n = unsafe { std::mem::zeroed() };
+        // SAFETY: We check if the uname call succeeded
+        assert_eq!(unsafe { libc::uname(&mut n) }, 0);
+        // SAFETY: Always safe
+        let release = unsafe { CStr::from_ptr(n.release.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        // Parse the major and minor version of the kernel
+        let mut r = release.split('.');
+        let major: i32 = str::parse(r.next().unwrap()).unwrap();
+        let minor: i32 = str::parse(r.next().unwrap()).unwrap();
+
+        // Skip this test if we're running on a too old kernel
+        if major > 5 || (major == 5 && minor >= 9) {
+            run_close_fds_test(close_fds_by_close_range);
+        }
+    }
+
+    #[test]
+    fn test_sanitize_process() {
+        run_close_fds_test(sanitize_process);
     }
 
     #[test]
@@ -471,7 +428,10 @@ mod tests {
 
         // Set environment variables
         for env_var in env_vars.iter() {
-            env::set_var(env_var, "0");
+            // SAFETY: the function is safe to call in a single-threaded program
+            unsafe {
+                env::set_var(env_var, "0");
+            }
         }
 
         // Cleanup the environment
@@ -482,306 +442,6 @@ mod tests {
         for env_var in env_vars.iter() {
             assert_eq!(env::var_os(env_var), None);
         }
-    }
-
-    #[allow(clippy::cognitive_complexity)]
-    #[test]
-    fn test_error_display() {
-        use std::ffi::CStr;
-
-        let path = PathBuf::from("/foo");
-        let file_str = "/foo/bar";
-        let file_path = PathBuf::from(file_str);
-        let proc_mounts = "/proc/mounts";
-        let controller = "sysfs";
-        let id = "foobar";
-        let err_args_parse = arg_parser::Error::UnexpectedArgument("foo".to_string());
-        let err_regex = regex::Error::Syntax(id.to_string());
-        let err2_str = "No such file or directory (os error 2)";
-        let cgroup_file = "cpuset.mems";
-
-        assert_eq!(
-            format!("{}", Error::ArgumentParsing(err_args_parse)),
-            "Failed to parse arguments: Found argument 'foo' which wasn't expected, or isn't \
-             valid in this context."
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::Canonicalize(path.clone(), io::Error::from_raw_os_error(2))
-            ),
-            format!("Failed to canonicalize path /foo: {}", err2_str)
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::CgroupInheritFromParent(path.clone(), file_str.to_string())
-            ),
-            "Failed to inherit cgroups configurations from file /foo/bar in path /foo",
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::Chmod(path.clone(), io::Error::from_raw_os_error(2))
-            ),
-            "Failed to change permissions on \"/foo\": No such file or directory (os error 2)",
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::CgroupLineNotFound(proc_mounts.to_string(), controller.to_string())
-            ),
-            "sysfs configurations not found in /proc/mounts",
-        );
-        assert_eq!(
-            format!("{}", Error::CgroupInvalidFile(cgroup_file.to_string())),
-            "Cgroup invalid file: cpuset.mems",
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::CgroupWrite("1".to_string(), "2".to_string(), cgroup_file.to_string())
-            ),
-            "Expected value 1 for cpuset.mems. Current value: 2",
-        );
-        assert_eq!(
-            format!("{}", Error::CgroupFormat(cgroup_file.to_string())),
-            "Invalid format for cgroups: cpuset.mems",
-        );
-
-        assert_eq!(
-            format!(
-                "{}",
-                Error::ChangeFileOwner(
-                    PathBuf::from("/dev/net/tun"),
-                    io::Error::from_raw_os_error(42)
-                )
-            ),
-            "Failed to change owner for \"/dev/net/tun\": No message of desired type (os error 42)",
-        );
-        assert_eq!(
-            format!("{}", Error::ChdirNewRoot(io::Error::from_raw_os_error(42))),
-            "Failed to chdir into chroot directory: No message of desired type (os error 42)"
-        );
-        assert_eq!(
-            format!("{}", Error::Clone(io::Error::from_raw_os_error(42))),
-            "Failed cloning into a new child process: No message of desired type (os error 42)",
-        );
-        assert_eq!(
-            format!("{}", Error::CloseNetNsFd(io::Error::from_raw_os_error(42))),
-            "Failed to close netns fd: No message of desired type (os error 42)",
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::CloseDevNullFd(io::Error::from_raw_os_error(42))
-            ),
-            "Failed to close /dev/null fd: No message of desired type (os error 42)",
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::Copy(
-                    file_path.clone(),
-                    path.clone(),
-                    io::Error::from_raw_os_error(2)
-                )
-            ),
-            format!("Failed to copy /foo/bar to /foo: {}", err2_str)
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::CreateDir(path, io::Error::from_raw_os_error(2))
-            ),
-            format!("Failed to create directory /foo: {}", err2_str)
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::CStringParsing(CString::new(b"f\0oo".to_vec()).unwrap_err())
-            ),
-            "Encountered interior \\0 while parsing a string",
-        );
-        assert_eq!(
-            format!("{}", Error::Dup2(io::Error::from_raw_os_error(42))),
-            "Failed to duplicate fd: No message of desired type (os error 42)",
-        );
-        assert_eq!(
-            format!("{}", Error::Exec(io::Error::from_raw_os_error(2))),
-            format!("Failed to exec into Firecracker: {}", err2_str)
-        );
-        assert_eq!(
-            format!("{}", Error::ExecFileName("foobarbaz".to_string())),
-            "Invalid filename. The filename of `--exec-file` option must contain \"firecracker\": \
-             foobarbaz",
-        );
-        assert_eq!(
-            format!("{}", Error::ExtractFileName(file_path.clone())),
-            "Failed to extract filename from path /foo/bar",
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::FileOpen(file_path.clone(), io::Error::from_raw_os_error(2))
-            ),
-            format!("Failed to open file /foo/bar: {}", err2_str)
-        );
-
-        let err = CStr::from_bytes_with_nul(b"/dev").err().unwrap();
-        assert_eq!(
-            format!("{}", Error::FromBytesWithNul(err)),
-            "Failed to decode string from byte array: data provided is not nul terminated",
-        );
-        assert_eq!(
-            format!("{}", Error::GetOldFdFlags(io::Error::from_raw_os_error(42))),
-            "Failed to get flags from fd: No message of desired type (os error 42)",
-        );
-        assert_eq!(
-            format!("{}", Error::Gid(id.to_string())),
-            "Invalid gid: foobar",
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::InvalidInstanceId(validators::Error::InvalidChar('a', 1))
-            ),
-            "Invalid instance ID: invalid char (a) at position 1",
-        );
-        assert_eq!(
-            format!("{}", Error::MissingParent(file_path.clone())),
-            "File /foo/bar doesn't have a parent",
-        );
-        assert_eq!(
-            format!("{}", Error::MkdirOldRoot(io::Error::from_raw_os_error(42))),
-            "Failed to create the jail root directory before pivoting root: No message of desired \
-             type (os error 42)",
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::MknodDev(io::Error::from_raw_os_error(42), "/dev/net/tun")
-            ),
-            "Failed to create /dev/net/tun via mknod inside the jail: No message of desired type \
-             (os error 42)",
-        );
-        assert_eq!(
-            format!("{}", Error::MountBind(io::Error::from_raw_os_error(42))),
-            "Failed to bind mount the jail root directory: No message of desired type (os error \
-             42)",
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::MountPropagationSlave(io::Error::from_raw_os_error(42))
-            ),
-            "Failed to change the propagation type to slave: No message of desired type (os error \
-             42)",
-        );
-        assert_eq!(
-            format!("{}", Error::NotAFile(file_path.clone())),
-            "/foo/bar is not a file",
-        );
-        assert_eq!(
-            format!("{}", Error::NotADirectory(file_path.clone())),
-            "/foo/bar is not a directory",
-        );
-        assert_eq!(
-            format!("{}", Error::OpenDevNull(io::Error::from_raw_os_error(42))),
-            "Failed to open /dev/null: No message of desired type (os error 42)",
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::OsStringParsing(file_path.clone(), file_path.clone().into_os_string())
-            ),
-            "Failed to parse path /foo/bar into an OsString",
-        );
-        assert_eq!(
-            format!("{}", Error::PivotRoot(io::Error::from_raw_os_error(42))),
-            "Failed to pivot root: No message of desired type (os error 42)",
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::ReadLine(file_path.clone(), io::Error::from_raw_os_error(2))
-            ),
-            format!("Failed to read line from /foo/bar: {}", err2_str)
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::ReadToString(file_path.clone(), io::Error::from_raw_os_error(2))
-            ),
-            format!("Failed to read file /foo/bar into a string: {}", err2_str)
-        );
-        assert_eq!(
-            format!("{}", Error::RegEx(err_regex.clone())),
-            format!("Regex failed: {:?}", err_regex),
-        );
-        assert_eq!(
-            format!("{}", Error::ResLimitArgument("foo".to_string())),
-            "Invalid resource argument: foo",
-        );
-        assert_eq!(
-            format!("{}", Error::ResLimitFormat("foo".to_string())),
-            "Invalid format for resources limits: foo",
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::ResLimitValue("foo".to_string(), "bar".to_string())
-            ),
-            "Invalid limit value for resource: foo: bar",
-        );
-        assert_eq!(
-            format!("{}", Error::RmOldRootDir(io::Error::from_raw_os_error(42))),
-            "Failed to remove old jail root directory: No message of desired type (os error 42)",
-        );
-        assert_eq!(
-            format!("{}", Error::SetCurrentDir(io::Error::from_raw_os_error(2))),
-            format!("Failed to change current directory: {}", err2_str),
-        );
-        assert_eq!(
-            format!("{}", Error::SetNetNs(io::Error::from_raw_os_error(42))),
-            "Failed to join network namespace: netns: No message of desired type (os error 42)",
-        );
-        assert_eq!(
-            format!("{}", Error::Setrlimit("foobar".to_string())),
-            "Failed to set limit for resource: foobar",
-        );
-        assert_eq!(
-            format!("{}", Error::SetSid(io::Error::from_raw_os_error(42))),
-            "Failed to daemonize: setsid: No message of desired type (os error 42)",
-        );
-        assert_eq!(
-            format!("{}", Error::Uid(id.to_string())),
-            "Invalid uid: foobar",
-        );
-        assert_eq!(
-            format!("{}", Error::UmountOldRoot(io::Error::from_raw_os_error(42))),
-            "Failed to unmount the old jail root: No message of desired type (os error 42)",
-        );
-        assert_eq!(
-            format!("{}", Error::UnexpectedListenerFd(42)),
-            "Unexpected value for the socket listener fd: 42",
-        );
-        assert_eq!(
-            format!("{}", Error::UnshareNewNs(io::Error::from_raw_os_error(42))),
-            "Failed to unshare into new mount namespace: No message of desired type (os error 42)",
-        );
-        assert_eq!(
-            format!("{}", Error::UnsetCloexec(io::Error::from_raw_os_error(42))),
-            "Failed to unset the O_CLOEXEC flag on the socket fd: No message of desired type (os \
-             error 42)",
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Error::Write(file_path, io::Error::from_raw_os_error(2))
-            ),
-            format!("Failed to write to /foo/bar: {}", err2_str),
-        );
     }
 
     #[test]

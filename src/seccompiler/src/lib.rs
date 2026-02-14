@@ -1,285 +1,217 @@
-// Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
-#![deny(missing_docs)]
 
-//! The library crate that defines common helper functions that are generally used in
-//! conjunction with seccompiler-bin.
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{Read, Seek};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
+use std::str::FromStr;
 
-mod common;
+mod bindings;
+use bindings::*;
 
-use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
-use std::io::Read;
-use std::sync::Arc;
+pub mod types;
+pub use types::*;
+use zerocopy::IntoBytes;
 
-use bincode::{DefaultOptions, Error as BincodeError, Options};
-use common::BPF_MAX_LEN;
-// Re-export the data types needed for calling the helper functions.
-pub use common::{sock_filter, BpfProgram};
+// This byte limit is passed to `bitcode` to guard against a potential memory
+// allocation DOS caused by binary filters that are too large.
+// This limit can be safely determined since the maximum length of a BPF
+// filter is 4096 instructions and Firecracker has a finite number of threads.
+const DESERIALIZATION_BYTES_LIMIT: usize = 100_000;
 
-/// Type that associates a thread category to a BPF program.
-pub type BpfThreadMap = HashMap<String, Arc<BpfProgram>>;
-
-// BPF structure definition for filter array.
-// See /usr/include/linux/filter.h .
-#[repr(C)]
-struct sock_fprog {
-    pub len: ::std::os::raw::c_ushort,
-    pub filter: *const sock_filter,
+/// Binary filter compilation errors.
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum CompilationError {
+    /// Cannot open input file: {0}
+    IntputOpen(std::io::Error),
+    /// Cannot read input file: {0}
+    InputRead(std::io::Error),
+    /// Cannot deserialize json: {0}
+    JsonDeserialize(serde_json::Error),
+    /// Cannot parse arch: {0}
+    ArchParse(String),
+    /// Cannot create libseccomp context
+    LibSeccompContext,
+    /// Cannot add libseccomp arch
+    LibSeccompArch,
+    /// Cannot add libseccomp syscall
+    LibSeccompSycall,
+    /// Cannot add libseccomp syscall rule
+    LibSeccompRule,
+    /// Cannot export libseccomp bpf
+    LibSeccompExport,
+    /// Cannot create memfd: {0}
+    MemfdCreate(std::io::Error),
+    /// Cannot rewind memfd: {0}
+    MemfdRewind(std::io::Error),
+    /// Cannot read from memfd: {0}
+    MemfdRead(std::io::Error),
+    /// Cannot create output file: {0}
+    OutputCreate(std::io::Error),
+    /// Cannot serialize bfp: {0}
+    BitcodeSerialize(bitcode::Error),
+    /// Serialized BPF exceeds size limit of {0} bytes
+    SizeLimitExceeded(usize),
 }
 
-/// Reference to program made up of a sequence of BPF instructions.
-pub type BpfProgramRef<'a> = &'a [sock_filter];
+pub fn compile_bpf(
+    input_path: &str,
+    arch: &str,
+    out_path: &str,
+    basic: bool,
+    split_output: bool,
+) -> Result<(), CompilationError> {
+    let mut file_content = String::new();
+    File::open(input_path)
+        .map_err(CompilationError::IntputOpen)?
+        .read_to_string(&mut file_content)
+        .map_err(CompilationError::InputRead)?;
+    let bpf_map_json: BpfJson =
+        serde_json::from_str(&file_content).map_err(CompilationError::JsonDeserialize)?;
 
-/// Binary filter deserialization errors.
-#[derive(Debug)]
-pub enum DeserializationError {
-    /// Error when doing bincode deserialization.
-    Bincode(BincodeError),
-}
+    let arch = TargetArch::from_str(arch).map_err(CompilationError::ArchParse)?;
 
-impl Display for DeserializationError {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        use self::DeserializationError::*;
-
-        match *self {
-            Bincode(ref err) => write!(f, "Bincode deserialization failed: {}", err),
-        }
-    }
-}
-
-/// Filter installation errors.
-#[derive(Debug, PartialEq, Eq)]
-pub enum InstallationError {
-    /// Filter exceeds the maximum number of instructions that a BPF program can have.
-    FilterTooLarge,
-    /// Error returned by `prctl`.
-    Prctl(i32),
-}
-impl std::error::Error for InstallationError {}
-
-impl Display for InstallationError {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        use self::InstallationError::*;
-
-        match *self {
-            FilterTooLarge => write!(
-                f,
-                "Filter length exceeds the maximum size of {} instructions ",
-                BPF_MAX_LEN
-            ),
-            Prctl(ref errno) => write!(f, "`prctl` syscall failed with error code: {}", errno),
-        }
-    }
-}
-
-/// Deserialize a BPF file into a collection of usable BPF filters.
-/// Has an optional `bytes_limit` that is passed to bincode to constrain the maximum amount of
-/// memory that we can allocate while performing the deserialization.
-/// It's recommended that the integrator of the library uses this to prevent memory allocations
-/// DOS-es.
-pub fn deserialize_binary<R: Read>(
-    reader: R,
-    bytes_limit: Option<u64>,
-) -> std::result::Result<BpfThreadMap, DeserializationError> {
-    let result = match bytes_limit {
-        // Also add the default options. These are not part of the `DefaultOptions` as per
-        // this issue: https://github.com/servo/bincode/issues/333
-        Some(limit) => DefaultOptions::new()
-            .with_fixint_encoding()
-            .allow_trailing_bytes()
-            .with_limit(limit)
-            .deserialize_from::<R, HashMap<String, BpfProgram>>(reader),
-        // No limit is the default.
-        None => bincode::deserialize_from::<R, HashMap<String, BpfProgram>>(reader),
-    };
-
-    Ok(result
-        .map_err(DeserializationError::Bincode)?
-        .into_iter()
-        .map(|(k, v)| (k.to_lowercase(), Arc::new(v)))
-        .collect())
-}
-
-/// Helper function for installing a BPF filter.
-pub fn apply_filter(bpf_filter: BpfProgramRef) -> std::result::Result<(), InstallationError> {
-    // If the program is empty, don't install the filter.
-    if bpf_filter.is_empty() {
-        return Ok(());
+    // SAFETY: Safe because the parameters are valid.
+    let memfd_fd = unsafe { libc::memfd_create(c"bpf".as_ptr().cast(), 0) };
+    if memfd_fd < 0 {
+        return Err(CompilationError::MemfdCreate(
+            std::io::Error::last_os_error(),
+        ));
     }
 
-    // If the program length is greater than the limit allowed by the kernel,
-    // fail quickly. Otherwise, `prctl` will give a more cryptic error code.
-    if bpf_filter.len() > BPF_MAX_LEN {
-        return Err(InstallationError::FilterTooLarge);
-    }
+    // SAFETY: Safe because the parameters are valid.
+    let mut memfd = unsafe { File::from_raw_fd(memfd_fd) };
 
-    unsafe {
-        {
-            let rc = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-            if rc != 0 {
-                return Err(InstallationError::Prctl(*libc::__errno_location()));
+    let mut bpf_map: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    for (name, filter) in bpf_map_json.0.iter() {
+        let default_action = filter.default_action.to_scmp_type();
+        let filter_action = filter.filter_action.to_scmp_type();
+
+        // SAFETY: Safe as all args are correct.
+        let bpf_filter = {
+            let r = seccomp_init(default_action);
+            if r.is_null() {
+                return Err(CompilationError::LibSeccompContext);
             }
-        }
-
-        let bpf_prog = sock_fprog {
-            len: bpf_filter.len() as u16,
-            filter: bpf_filter.as_ptr(),
+            r
         };
-        let bpf_prog_ptr = &bpf_prog as *const sock_fprog;
-        {
-            let rc = libc::prctl(
-                libc::PR_SET_SECCOMP,
-                libc::SECCOMP_MODE_FILTER,
-                bpf_prog_ptr,
-            );
-            if rc != 0 {
-                return Err(InstallationError::Prctl(*libc::__errno_location()));
+
+        // SAFETY: Safe as all args are correct.
+        unsafe {
+            let r = seccomp_arch_add(bpf_filter, arch.to_scmp_type());
+            if r != 0 && r != MINUS_EEXIST {
+                return Err(CompilationError::LibSeccompArch);
             }
         }
+
+        for rule in filter.filter.iter() {
+            // SAFETY: Safe as all args are correct.
+            let syscall = unsafe {
+                let r = seccomp_syscall_resolve_name(rule.syscall.as_ptr());
+                if r == __NR_SCMP_ERROR {
+                    return Err(CompilationError::LibSeccompSycall);
+                }
+                r
+            };
+
+            // TODO remove when we drop deprecated "basic" arg from cli.
+            // "basic" bpf means it ignores condition checks.
+            if basic {
+                // SAFETY: Safe as all args are correct.
+                unsafe {
+                    if seccomp_rule_add(bpf_filter, filter_action, syscall, 0) != 0 {
+                        return Err(CompilationError::LibSeccompRule);
+                    }
+                }
+            } else if let Some(rules) = &rule.args {
+                let comparators = rules
+                    .iter()
+                    .map(|rule| rule.to_scmp_type())
+                    .collect::<Vec<scmp_arg_cmp>>();
+
+                // SAFETY: Safe as all args are correct.
+                // We can assume no one will define u32::MAX
+                // filters for a syscall.
+                #[allow(clippy::cast_possible_truncation)]
+                unsafe {
+                    if seccomp_rule_add_array(
+                        bpf_filter,
+                        filter_action,
+                        syscall,
+                        comparators.len() as u32,
+                        comparators.as_ptr(),
+                    ) != 0
+                    {
+                        return Err(CompilationError::LibSeccompRule);
+                    }
+                }
+            } else {
+                // SAFETY: Safe as all args are correct.
+                unsafe {
+                    if seccomp_rule_add(bpf_filter, filter_action, syscall, 0) != 0 {
+                        return Err(CompilationError::LibSeccompRule);
+                    }
+                }
+            }
+        }
+
+        // SAFETY: Safe as all args are correect.
+        unsafe {
+            if seccomp_export_bpf(bpf_filter, memfd.as_raw_fd()) != 0 {
+                return Err(CompilationError::LibSeccompExport);
+            }
+        }
+        memfd.rewind().map_err(CompilationError::MemfdRewind)?;
+
+        // Cast is safe because usize == u64
+        #[allow(clippy::cast_possible_truncation)]
+        let size = memfd.metadata().unwrap().size() as usize;
+        // Bpf instructions are 8 byte values and 4 byte alignment.
+        // We use u64 to satisfy these requirements.
+        let instructions = size / std::mem::size_of::<u64>();
+        let mut bpf = vec![0_u64; instructions];
+
+        memfd
+            .read_exact(bpf.as_mut_bytes())
+            .map_err(CompilationError::MemfdRead)?;
+        memfd.rewind().map_err(CompilationError::MemfdRewind)?;
+
+        bpf_map.insert(name.clone(), bpf);
+    }
+
+    if split_output {
+        // Output individual files for each thread (for testing)
+        let base_path = Path::new(out_path);
+        let parent = base_path.parent().unwrap_or_else(|| Path::new("."));
+
+        for (thread_name, bpf_data) in &bpf_map {
+            let thread_file_path = parent.join(format!("{}.bpf", thread_name));
+            let mut thread_file =
+                File::create(&thread_file_path).map_err(CompilationError::OutputCreate)?;
+
+            // Write raw BPF data as bytes
+            use zerocopy::IntoBytes;
+            std::io::Write::write_all(&mut thread_file, bpf_data.as_bytes())
+                .map_err(CompilationError::OutputCreate)?;
+        }
+    } else {
+        // Create and write the main bitcode output file
+        let mut output_file = File::create(out_path).map_err(CompilationError::OutputCreate)?;
+        let encoded = bitcode::serialize(&bpf_map).map_err(CompilationError::BitcodeSerialize)?;
+
+        // Check size limit to prevent DOS attacks
+        if encoded.len() > DESERIALIZATION_BYTES_LIMIT {
+            return Err(CompilationError::SizeLimitExceeded(
+                DESERIALIZATION_BYTES_LIMIT,
+            ));
+        }
+
+        std::io::Write::write_all(&mut output_file, &encoded)
+            .map_err(CompilationError::OutputCreate)?;
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::thread;
-
-    use super::*;
-    use crate::common::BpfProgram;
-    #[test]
-    fn test_deserialize_binary() {
-        // Malformed bincode binary.
-        {
-            let data = "adassafvc".to_string();
-            assert!(deserialize_binary(data.as_bytes(), None).is_err());
-        }
-
-        // Test that the binary deserialization is correct, and that the thread keys
-        // have been lowercased.
-        {
-            let bpf_prog = vec![
-                sock_filter {
-                    code: 32,
-                    jt: 0,
-                    jf: 0,
-                    k: 0,
-                },
-                sock_filter {
-                    code: 32,
-                    jt: 0,
-                    jf: 0,
-                    k: 4,
-                },
-            ];
-            let mut filter_map: HashMap<String, BpfProgram> = HashMap::new();
-            filter_map.insert("VcpU".to_string(), bpf_prog.clone());
-            let bytes = bincode::serialize(&filter_map).unwrap();
-
-            let mut expected_res = BpfThreadMap::new();
-            expected_res.insert("vcpu".to_string(), Arc::new(bpf_prog));
-            assert_eq!(deserialize_binary(&bytes[..], None).unwrap(), expected_res);
-        }
-
-        // Test deserialization with binary_limit.
-        {
-            let bpf_prog = vec![sock_filter {
-                code: 32,
-                jt: 0,
-                jf: 0,
-                k: 0,
-            }];
-
-            let mut filter_map: HashMap<String, BpfProgram> = HashMap::new();
-            filter_map.insert("t1".to_string(), bpf_prog.clone());
-
-            let bytes = bincode::serialize(&filter_map).unwrap();
-
-            // Binary limit too low.
-            assert!(matches!(
-                deserialize_binary(&bytes[..], Some(20)).unwrap_err(),
-                DeserializationError::Bincode(error)
-                    if error.to_string() == "the size limit has been reached"
-            ));
-
-            let mut expected_res = BpfThreadMap::new();
-            expected_res.insert("t1".to_string(), Arc::new(bpf_prog));
-
-            // Correct binary limit.
-            assert_eq!(
-                deserialize_binary(&bytes[..], Some(50)).unwrap(),
-                expected_res
-            );
-        }
-    }
-
-    #[test]
-    fn test_filter_apply() {
-        // Test filter too large.
-        thread::spawn(|| {
-            let filter: BpfProgram = vec![
-                sock_filter {
-                    code: 6,
-                    jt: 0,
-                    jf: 0,
-                    k: 0,
-                };
-                5000 // Limit is 4096
-            ];
-
-            // Apply seccomp filter.
-            assert_eq!(
-                apply_filter(&filter).unwrap_err(),
-                InstallationError::FilterTooLarge
-            );
-        })
-        .join()
-        .unwrap();
-
-        // Test empty filter.
-        thread::spawn(|| {
-            let filter: BpfProgram = vec![];
-
-            assert_eq!(filter.len(), 0);
-
-            let seccomp_level = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
-            assert_eq!(seccomp_level, 0);
-
-            apply_filter(&filter).unwrap();
-
-            // test that seccomp level remains 0 on failure.
-            let seccomp_level = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
-            assert_eq!(seccomp_level, 0);
-        })
-        .join()
-        .unwrap();
-
-        // Test invalid BPF code.
-        thread::spawn(|| {
-            let filter = vec![sock_filter {
-                // invalid opcode
-                code: 9999,
-                jt: 0,
-                jf: 0,
-                k: 0,
-            }];
-
-            let seccomp_level = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
-            assert_eq!(seccomp_level, 0);
-
-            assert_eq!(
-                apply_filter(&filter).unwrap_err(),
-                InstallationError::Prctl(22)
-            );
-
-            // test that seccomp level remains 0 on failure.
-            let seccomp_level = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
-            assert_eq!(seccomp_level, 0);
-        })
-        .join()
-        .unwrap();
-    }
 }

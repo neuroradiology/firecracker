@@ -2,14 +2,39 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests ensuring codebase style compliance for Python."""
 
-from framework import utils
+import sys
+from subprocess import run
+
+import pytest
 
 
-def test_python_style():
+@pytest.mark.parametrize("formatter", ["black --config tests/pyproject.toml", "isort"])
+def test_python_style(formatter):
     """
-    Test that python code passes style checks.
-
-    @type: style
+    Test that python code passes `formatter`
     """
-    # Runs command
-    utils.run_cmd("black . --check --diff")
+    run(
+        f"{formatter} --check --diff tests tools .buildkite",
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        shell=True,
+        cwd="..",
+        check=True,
+    )
+
+
+def test_python_pylint():
+    """
+    Test that python code passes linter checks.
+    """
+    # List of linter commands that should be executed for each file
+    linter_cmd = "pylint --rcfile tests/pyproject.toml --output-format=colorized tests/ tools/ .buildkite/*.py"
+    run(
+        linter_cmd,
+        # we let pytest capture stdout/stderr for us
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        shell=True,
+        cwd="..",
+        check=True,
+    )

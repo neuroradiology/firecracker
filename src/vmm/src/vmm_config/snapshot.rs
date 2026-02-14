@@ -5,29 +5,26 @@
 
 use std::path::PathBuf;
 
+/// For crates that depend on `vmm` we export.
+pub use semver::Version;
 use serde::{Deserialize, Serialize};
 
 /// The snapshot type options that are available when
 /// creating a new snapshot.
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub enum SnapshotType {
     /// Diff snapshot.
     Diff,
     /// Full snapshot.
+    #[default]
     Full,
-}
-
-impl Default for SnapshotType {
-    fn default() -> Self {
-        SnapshotType::Full
-    }
 }
 
 /// Specifies the method through which guest memory will get populated when
 /// resuming from a snapshot:
 /// 1) A file that contains the guest memory to be loaded,
-/// 2) An UDS where a custom page-fault handler process is listening for
-///    the UFFD set up by Firecracker to handle its guest memory page faults.
+/// 2) An UDS where a custom page-fault handler process is listening for the UFFD set up by
+///    Firecracker to handle its guest memory page faults.
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 pub enum MemBackendType {
     /// Guest memory contents will be loaded from a file.
@@ -37,7 +34,7 @@ pub enum MemBackendType {
 }
 
 /// Stores the configuration that will be used for creating a snapshot.
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateSnapshotParams {
     /// This marks the type of snapshot we want to create.
@@ -48,9 +45,16 @@ pub struct CreateSnapshotParams {
     pub snapshot_path: PathBuf,
     /// Path to the file that will contain the guest memory.
     pub mem_file_path: PathBuf,
-    /// Optional field for the microVM version. The default
-    /// value is the current version.
-    pub version: Option<String>,
+}
+
+/// Allows for changing the mapping between tap devices and host devices
+/// during snapshot restore
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+pub struct NetworkOverride {
+    /// The index of the interface to modify
+    pub iface_id: String,
+    /// The new name of the interface to be assigned
+    pub host_dev_name: String,
 }
 
 /// Stores the configuration that will be used for loading a snapshot.
@@ -60,16 +64,18 @@ pub struct LoadSnapshotParams {
     pub snapshot_path: PathBuf,
     /// Specifies guest memory backend configuration.
     pub mem_backend: MemBackendConfig,
-    /// Setting this flag will enable KVM dirty page tracking and will
-    /// allow taking subsequent incremental snapshots.
-    pub enable_diff_snapshots: bool,
+    /// Whether KVM dirty page tracking should be enabled, to space optimization
+    /// of differential snapshots.
+    pub track_dirty_pages: bool,
     /// When set to true, the vm is also resumed if the snapshot load
     /// is successful.
     pub resume_vm: bool,
+    /// The network devices to override on load.
+    pub network_overrides: Vec<NetworkOverride>,
 }
 
 /// Stores the configuration for loading a snapshot that is provided by the user.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoadSnapshotConfig {
     /// Path to the file that contains the microVM state to be loaded.
@@ -84,10 +90,17 @@ pub struct LoadSnapshotConfig {
     pub mem_backend: Option<MemBackendConfig>,
     /// Whether or not to enable KVM dirty page tracking.
     #[serde(default)]
+    #[deprecated]
     pub enable_diff_snapshots: bool,
+    /// Whether KVM dirty page tracking should be enabled.
+    #[serde(default)]
+    pub track_dirty_pages: bool,
     /// Whether or not to resume the vm post snapshot load.
     #[serde(default)]
     pub resume_vm: bool,
+    /// The network devices to override on load.
+    #[serde(default)]
+    pub network_overrides: Vec<NetworkOverride>,
 }
 
 /// Stores the configuration used for managing snapshot memory.

@@ -1,150 +1,199 @@
 # Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+
 """Utilities for measuring memory utilization for a process."""
-from queue import Queue
+
 import time
-from threading import Thread, Lock
+from threading import Thread
 
-from framework import utils
+import psutil
+
+from framework.properties import global_props
 
 
-class MemoryUsageExceededException(Exception):
+class MemoryUsageExceededError(Exception):
     """A custom exception containing details on excessive memory usage."""
 
-    def __init__(self, usage, threshold):
+    def __init__(self, usage, threshold, *args):
         """Compose the error message containing the memory consumption."""
         super().__init__(
-            "Memory usage ({} KiB) exceeded maximum threshold ({} KiB).\n".format(
-                usage, threshold
-            )
+            f"Memory usage ({usage / (1 << 20):.2f} MiB) exceeded maximum threshold "
+            f"({threshold / (1 << 20)} MiB)",
+            *args,
         )
 
 
 class MemoryMonitor(Thread):
-    """Class to represent a RSS memory monitor for a Firecracker process.
+    """Class to represent an RSS memory monitor for a Firecracker process.
 
     The guest's memory region is skipped, as the main interest is the
     VMM memory usage.
     """
 
-    MEMORY_THRESHOLD = 5 * 1024
-    MEMORY_SAMPLE_TIMEOUT_S = 1
+    # If guest memory is >3GiB, it is split in a 2nd region
+    # Gap starts at 3GiBs and is 1GiB long
+    X86_32BIT_MEMORY_GAP_START = 3 << 30
+    X86_32BIT_MEMORY_GAP_SIZE = 1 << 30
+    # If guest memory is >255GiB, it is split in a 3rd region
+    # Gap starts at 256 GiB and is 256GiB long
+    X86_64BIT_MEMORY_GAP_START = 256 << 30
+    # On ARM64 we just have a single gap, but memory starts at an offset
+    # Gap starts at 256 GiB and is GiB long
+    # Memory starts at 2GiB
+    ARM64_64BIT_MEMORY_GAP_START = 256 << 30
+    ARM64_MEMORY_START = 2 << 30
 
-    def __init__(self):
+    def __init__(
+        self,
+        vm,
+        threshold_booted=5 << 20,
+        threshold_snapshot=6 << 20,
+        threshold_restored=5 << 20,
+        period_s=0.01,
+    ):
         """Initialize monitor attributes."""
         Thread.__init__(self)
-        self._pid = None
-        self._guest_mem_mib = None
-        self._guest_mem_start = None
-        self._exceeded_queue = Queue()
-        self._threshold = self.MEMORY_THRESHOLD
+        self._vm = vm
+        self.threshold_booted = threshold_booted
+        self.threshold_snapshot = threshold_snapshot
+        self.threshold_restored = threshold_restored
+        # Start with booted threshold by default
+        self.threshold = threshold_booted
+        self._exceeded = None
+        self._period_s = period_s
         self._should_stop = False
         self._current_rss = 0
-        self._lock = Lock()
-
-    @property
-    def pid(self):
-        """Get the pid."""
-        return self._pid
-
-    @property
-    def guest_mem_mib(self):
-        """Get the guest memory in MiB."""
-        return self._guest_mem_mib
-
-    @property
-    def threshold(self):
-        """Get the memory threshold."""
-        return self._threshold
-
-    @property
-    def exceeded_queue(self):
-        """Get the exceeded queue."""
-        return self._exceeded_queue
-
-    @guest_mem_mib.setter
-    def guest_mem_mib(self, guest_mem_mib):
-        """Set the guest memory MiB."""
-        self._guest_mem_mib = guest_mem_mib
-
-    @pid.setter
-    def pid(self, pid):
-        """Set the pid."""
-        self._pid = pid
-
-    @threshold.setter
-    def threshold(self, threshold):
-        """Set the threshold."""
-        self._threshold = threshold
+        self.daemon = True
 
     def signal_stop(self):
         """Signal that the thread should stop."""
         self._should_stop = True
 
+    def set_threshold_for_restored_vm(self):
+        """Set threshold for a restored VM."""
+        self.threshold = self.threshold_restored
+
+    def set_threshold_for_snapshot(self):
+        """Set threshold for snapshot creation."""
+        self.threshold = self.threshold_snapshot
+
+    def stop(self):
+        """Stop the thread"""
+        if self.is_alive():
+            self.signal_stop()
+            self.join(timeout=1)
+
     def run(self):
         """Thread for monitoring the RSS memory usage of a Firecracker process.
 
-        `pmap` is used to compute the memory overhead. If it exceeds
-        the maximum value, it is pushed in a thread safe queue and memory
-        monitoring ceases. It is up to the caller to check the queue.
+        If overhead memory exceeds the maximum value, it is saved and memory
+        monitoring ceases. It is up to the caller to check.
         """
-        pmap_cmd = "pmap -xq {}".format(self.pid)
 
+        guest_mem_bytes = self._vm.mem_size_bytes
+        try:
+            ps = psutil.Process(self._vm.firecracker_pid)
+        except (psutil.NoSuchProcess, FileNotFoundError):
+            return
         while not self._should_stop:
-            mem_total = 0
             try:
-                _, stdout, _ = utils.run_cmd(pmap_cmd)
-                pmap_out = stdout.split("\n")
-
-            except ChildProcessError:
+                mmaps = ps.memory_maps(grouped=False)
+            except psutil.NoSuchProcess:
                 return
-            for line in pmap_out:
-                tokens = line.split()
-                if not tokens:
-                    break
-                try:
-                    address = int(tokens[0].lstrip("0"), 16)
-                    total_size = int(tokens[1])
-                    rss = int(tokens[2])
-                except ValueError:
-                    # This line doesn't contain memory related information.
+            mem_total = 0
+            for mmap in mmaps:
+                if self.is_guest_mem(mmap.size, guest_mem_bytes):
                     continue
-                if (
-                    self._guest_mem_start is None
-                    and total_size == self.guest_mem_mib * 1024
-                ):
-                    # This is the start of the guest's memory region.
-                    self._guest_mem_start = address
-                    continue
-                if self.is_in_guest_mem_region(address):
-                    continue
-                mem_total += rss
-            with self._lock:
-                self._current_rss = mem_total
+
+                mem_total += mmap.rss
+            self._current_rss = mem_total
             if mem_total > self.threshold:
-                self.exceeded_queue.put(mem_total)
+                self._exceeded = ps
                 return
 
-            time.sleep(self.MEMORY_SAMPLE_TIMEOUT_S)
+            time.sleep(self._period_s)
 
-    def is_in_guest_mem_region(self, address):
-        """Check if the address is inside the guest memory region."""
-        if self._guest_mem_start is None:
-            return False
-        guest_mem_end = self._guest_mem_start + self.guest_mem_mib
-        return self._guest_mem_start <= address < guest_mem_end
+    def is_guest_mem_x86(self, size, guest_mem_bytes):
+        """
+        Checks if a region is a guest memory region based on
+        x86_64 physical memory layout
+        """
+        # it could be bigger if hotplugging is enabled
+        # if it's bigger, it's likely not from FC because we don't have big allocations
+        return size >= guest_mem_bytes or size in (
+            # memory fits before the first gap
+            guest_mem_bytes,
+            # guest memory spans at least two regions & memory fits before the second gap
+            self.X86_32BIT_MEMORY_GAP_START,
+            # guest memory spans exactly two regions
+            guest_mem_bytes - self.X86_32BIT_MEMORY_GAP_START,
+            # guest memory fills the space between the two gaps
+            self.X86_64BIT_MEMORY_GAP_START
+            - self.X86_32BIT_MEMORY_GAP_START
+            - self.X86_32BIT_MEMORY_GAP_SIZE,
+            # guest memory spans 3 regions, this is what remains past the second gap
+            guest_mem_bytes
+            - self.X86_64BIT_MEMORY_GAP_START
+            + self.X86_32BIT_MEMORY_GAP_SIZE,
+        )
+
+    def is_guest_mem_arch64(self, size, guest_mem_bytes):
+        """
+        Checks if a region is a guest memory region based on
+        ARM64 physical memory layout
+        """
+        # it could be bigger if hotplugging is enabled
+        # if it's bigger, it's likely not from FC because we don't have big allocations
+        return size >= guest_mem_bytes or size in (
+            # guest memory fits before the gap
+            guest_mem_bytes,
+            # guest memory fills the space before the gap
+            self.ARM64_64BIT_MEMORY_GAP_START - self.ARM64_MEMORY_START,
+            # guest memory spans 2 regions, this is what remains past the gap
+            guest_mem_bytes
+            - self.ARM64_64BIT_MEMORY_GAP_START
+            + self.ARM64_MEMORY_START,
+        )
+
+    def is_guest_mem(self, size, guest_mem_bytes):
+        """
+        If the address is recognised as a guest memory region,
+        return True, otherwise return False.
+        """
+
+        if global_props.cpu_architecture == "x86_64":
+            return self.is_guest_mem_x86(size, guest_mem_bytes)
+
+        return self.is_guest_mem_arch64(size, guest_mem_bytes)
 
     def check_samples(self):
         """Check that there are no samples over the threshold."""
-        if not self.exceeded_queue.empty():
-            raise MemoryUsageExceededException(
-                self.exceeded_queue.get(), self.threshold
+        if self._exceeded is not None:
+            raise MemoryUsageExceededError(
+                self._current_rss, self.threshold, self._exceeded
             )
 
     @property
     def current_rss(self):
         """Obtain current RSS for Firecracker's overhead."""
         # This is to ensure that the monitor has updated itself.
-        time.sleep(self.MEMORY_SAMPLE_TIMEOUT_S + 0.5)
-        with self._lock:
-            return self._current_rss
+        time.sleep(2 * self._period_s)
+        return self._current_rss
+
+    def __enter__(self):
+        """To use it as a Context Manager
+
+        >>> mm = MemoryMonitor(vm, threshold=10*1024)
+        >>> with mm:
+        >>>    # do stuff
+        """
+
+        self.start()
+
+    def __exit__(self, _type, _value, _traceback):
+        """Exit context"""
+
+        if self.is_alive():
+            self.signal_stop()
+            self.join(timeout=1)
+        self.check_samples()

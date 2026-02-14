@@ -4,9 +4,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ./tools/devtool shell --privileged
-# bindgen-0.60 has a dependency that needs Rust edition 2021
-# cargo +stable install bindgen
+# cargo install bindgen-cli
 # apt update && apt install patch
+# ./tools/bindgen.sh
 
 set -eu
 
@@ -30,33 +30,42 @@ function fc-bindgen {
     non_camel_case_types,
     non_upper_case_globals,
     dead_code,
-    non_snake_case
+    non_snake_case,
+    clippy::ptr_as_ptr,
+    clippy::undocumented_unsafe_blocks,
+    missing_debug_implementations,
+    clippy::tests_outside_test_module,
+    unsafe_op_in_unsafe_fn,
+    clippy::redundant_static_lifetimes
 )]
 
 EOF
-    bindgen --disable-header-comment --size_t-is-usize --constified-enum '*' --with-derive-default --with-derive-partialeq $@
+    bindgen --no-doc-comments --disable-header-comment --constified-enum-module '.*' --with-derive-default --with-derive-partialeq $@
 }
 
-KERNEL_HEADERS_HOME="/usr"
+KERNEL_BRANCH="linux-6.13.y"
+KERNEL_DIR="./$KERNEL_BRANCH"
+HEADERS_DIR=$(realpath "./linux-headers")
+# https://www.kernel.org/doc/Documentation/kbuild/headers_install.txt
+# The Linux repo is huge. Just copy what we need.
+[ -d $KERNEL_DIR ] || git clone --branch $KERNEL_BRANCH --depth 1 https://github.com/amazonlinux/linux $KERNEL_DIR
 
-info "BINDGEN in.h"
-fc-bindgen "$KERNEL_HEADERS_HOME/include/linux/in.h" \
-           --allowlist-var='IP.*' \
-           --allowlist-var='IN.*' \
-           --allowlist-var='MCAST' \
-           --allowlist-type='in_.*' \
-           --allowlist-type='ip_.*' \
-    |replace_linux_int_types >src/net_gen/src/inn.rs
+(rm -rf $HEADERS_DIR && cd $KERNEL_DIR && make headers_install ARCH=x86_64 INSTALL_HDR_PATH=$HEADERS_DIR)
+
+INCLUDE="$HEADERS_DIR/include/"
+ARCH_X86_INCLUDE="$KERNEL_DIR/arch/x86/include"
+
+export BINDGEN_EXTRA_CLANG_ARGS="-I$INCLUDE -I$ARCH_X86_INCLUDE"
 
 info "BINDGEN sockios.h"
-fc-bindgen "$KERNEL_HEADERS_HOME/include/linux/sockios.h" |replace_linux_int_types >src/net_gen/src/sockios.rs
+fc-bindgen "$INCLUDE/linux/sockios.h" |replace_linux_int_types >src/vmm/src/devices/virtio/net/generated/sockios.rs
 
 info "BINDGEN if.h"
-fc-bindgen "$KERNEL_HEADERS_HOME/include/linux/if.h" \
+fc-bindgen "$INCLUDE/linux/if.h" \
            --allowlist-var='IF.*' \
            --allowlist-type='if.*' \
            --allowlist-type="net_device.*" \
-           -- -D __UAPI_DEF_IF_IFNAMSIZ -D __UAPI_DEF_IF_NET_DEVICE_FLAGS -D __UAPI_DEF_IF_IFREQ -D __UAPI_DEF_IF_IFMAP >src/net_gen/src/iff.rs
+           -- -D __UAPI_DEF_IF_IFNAMSIZ -D __UAPI_DEF_IF_NET_DEVICE_FLAGS -D __UAPI_DEF_IF_IFREQ -D __UAPI_DEF_IF_IFMAP >src/vmm/src/devices/virtio/net/generated/iff.rs
 
 info "BINDGEN if_tun.h"
 fc-bindgen \
@@ -68,35 +77,85 @@ fc-bindgen \
     --allowlist-var='IFF_VNET_HDR' \
     --allowlist-var='ETH_.*' \
     --allowlist-type='ifreq' \
-   "$KERNEL_HEADERS_HOME/include/linux/if_tun.h" >src/net_gen/src/if_tun.rs
+   "$INCLUDE/linux/if_tun.h" >src/vmm/src/devices/virtio/net/generated/if_tun.rs
 
 info "BINDGEN virtio_ring.h"
 fc-bindgen \
     --allowlist-var "VIRTIO_RING_F_EVENT_IDX" \
-    "$KERNEL_HEADERS_HOME/include/linux/virtio_ring.h" >src/virtio_gen/src/virtio_ring.rs
+    "$INCLUDE/linux/virtio_ring.h" >src/vmm/src/devices/virtio/generated/virtio_ring.rs
+
+info "BINDGEN virtio_config.h"
+fc-bindgen \
+    --allowlist-var "VIRTIO_F_.*" \
+    "$INCLUDE/linux/virtio_config.h" >src/vmm/src/devices/virtio/generated/virtio_config.rs
 
 info "BINDGEN virtio_blk.h"
 fc-bindgen \
     --allowlist-var "VIRTIO_BLK_.*" \
-    --allowlist-var "VIRTIO_F_.*" \
-    "$KERNEL_HEADERS_HOME/include/linux/virtio_blk.h" >src/virtio_gen/src/virtio_blk.rs
+    "$INCLUDE/linux/virtio_blk.h" >src/vmm/src/devices/virtio/generated/virtio_blk.rs
 
 info "BINDGEN virtio_net.h"
 fc-bindgen \
     --allowlist-var "VIRTIO_NET_F_.*" \
-    --allowlist-var "VIRTIO_F_.*" \
     --allowlist-type "virtio_net_hdr_v1" \
-    "$KERNEL_HEADERS_HOME/include/linux/virtio_net.h" >src/virtio_gen/src/virtio_net.rs
+    "$INCLUDE/linux/virtio_net.h" >src/vmm/src/devices/virtio/generated/virtio_net.rs
 
-# https://www.kernel.org/doc/Documentation/kbuild/headers_install.txt
-# The Linux repo is huge. Just copy what we need.
-# git clone --branch v5.10 --depth 1 https://github.com/torvalds/linux.git linux
-git clone --branch linux-5.10.y --depth 1 https://github.com/amazonlinux/linux amazonlinux-v5.10.y
+info "BINDGEN virtio_ids.h"
+fc-bindgen \
+    --allowlist-var "VIRTIO_ID.*" \
+    "$INCLUDE/linux/virtio_ids.h" >src/vmm/src/devices/virtio/generated/virtio_ids.rs
+
+info "BINDGEN virtio_mem.h"
+fc-bindgen \
+    --allowlist-var "VIRTIO_MEM.*" \
+    --allowlist-type "virtio_mem.*" \
+    "$INCLUDE/linux/virtio_mem.h" >src/vmm/src/devices/virtio/generated/virtio_mem.rs
+
+info "BINDGEN prctl.h"
+fc-bindgen \
+    --allowlist-var "PR_.*" \
+    "$INCLUDE/linux/prctl.h" >src/firecracker/src/generated/prctl.rs
+sed -i '/PR_SET_SPECULATION_CTRL/s/u32/i32/g' src/firecracker/src/generated/prctl.rs
 
 info "BINDGEN mpspec_def.h"
-fc-bindgen amazonlinux-v5.10.y/arch/x86/include/asm/mpspec_def.h \
-           >src/arch_gen/src/x86/mpspec.rs
+fc-bindgen $ARCH_X86_INCLUDE/asm/mpspec_def.h \
+           >src/vmm/src/arch/x86_64/generated/mpspec.rs
 # https://github.com/rust-lang/rust-bindgen/issues/1274
+
+info "BINDGEN msr-index.h"
+fc-bindgen $ARCH_X86_INCLUDE/asm/msr-index.h \
+    --allowlist-var "^MSR_.*$" \
+    -- \
+    -Wno-macro-redefined \
+    >src/vmm/src/arch/x86_64/generated/msr_index.rs
+perl -i -pe 's/= (\d+);/sprintf("= 0x%x;",$1)/eg' src/vmm/src/arch/x86_64/generated/msr_index.rs
+
+info "BINDGEN perf_event.h"
+grep "MSR_ARCH_PERFMON_" $ARCH_X86_INCLUDE/asm/perf_event.h \
+    >$ARCH_X86_INCLUDE/asm/perf_event_msr.h
+fc-bindgen $ARCH_X86_INCLUDE/asm/perf_event_msr.h \
+    --allowlist-var "^MSR_ARCH_PERFMON_.*$" \
+    -- \
+    >src/vmm/src/arch/x86_64/generated/perf_event.rs
+perl -i -pe 's/= (\d+);/sprintf("= 0x%x;",$1)/eg' src/vmm/src/arch/x86_64/generated/perf_event.rs
+
+info "BINDGEN hyperv.h"
+grep "#define HV_X64_MSR_" $KERNEL_DIR/arch/x86/kvm/hyperv.h \
+    >$KERNEL_DIR/arch/x86/kvm/hyperv_msr.h
+fc-bindgen $KERNEL_DIR/arch/x86/kvm/hyperv_msr.h \
+    --allowlist-var "^HV_X64_MSR_.*$" \
+    -- \
+    >src/vmm/src/arch/x86_64/generated/hyperv.rs
+perl -i -pe 's/= (\d+);/sprintf("= 0x%x;",$1)/eg' src/vmm/src/arch/x86_64/generated/hyperv.rs
+
+info "BINDGEN hyperv-tlfs.h"
+grep "HV_X64_MSR_" $ARCH_X86_INCLUDE/asm/hyperv-tlfs.h \
+    >$ARCH_X86_INCLUDE/asm/hyperv-tlfs_msr.h
+fc-bindgen $ARCH_X86_INCLUDE/asm/hyperv-tlfs_msr.h \
+    --allowlist-var "^HV_X64_MSR_.*$" \
+    -- \
+    >src/vmm/src/arch/x86_64/generated/hyperv_tlfs.rs
+perl -i -pe 's/= (\d+);/sprintf("= 0x%x;",$1)/eg' src/vmm/src/arch/x86_64/generated/hyperv_tlfs.rs
 
 info "BINDGEN io_uring.h"
 fc-bindgen \
@@ -105,16 +164,22 @@ fc-bindgen \
     --allowlist-var "IOSQE_.+" \
     --allowlist-type "io_uring_.+" \
     --allowlist-type "io_.qring_offsets" \
-    "amazonlinux-v5.10.y/include/uapi/linux/io_uring.h" \
-    >src/io_uring/src/bindings.rs
+    "$INCLUDE/linux/io_uring.h" \
+    >src/vmm/src/io_uring/generated.rs
+
+info "BINDGEN asm/prctl.h"
+fc-bindgen \
+    --allowlist-var "ARCH_.*" \
+    "$ARCH_X86_INCLUDE/uapi/asm/prctl.h" >src/vmm/src/arch/x86_64/generated/arch_prctl.rs
+
+info "BINDGEN include/uapi/linux/vmclock-abi.h"
+fc-bindgen \
+    "$KERNEL_DIR/include/uapi/linux/vmclock-abi.h" > src/vmm/src/devices/acpi/generated/vmclock_abi.rs
 
 # Apply any patches
-# src/virtio_gen
-for crate in src/net_gen; do
-    for patch in $(dirname $0)/bindgen-patches/$(basename $crate)/*.patch; do
-        echo PATCH $crate/$patch
-        (cd $crate; patch -p1) <$patch
-    done
+info "Apply patches"
+for PATCH in $(dirname $0)/bindgen-patches/*.patch; do
+    git apply $PATCH
 done
 
 echo "Bindings created correctly! You might want to run ./tools/test_bindings.py to test for ABI incompatibilities"

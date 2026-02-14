@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use libc::{
-    c_int, c_void, siginfo_t, SIGBUS, SIGHUP, SIGILL, SIGPIPE, SIGSEGV, SIGSYS, SIGXCPU, SIGXFSZ,
+    SIGBUS, SIGHUP, SIGILL, SIGPIPE, SIGSEGV, SIGSYS, SIGXCPU, SIGXFSZ, c_int, c_void, siginfo_t,
 };
-use logger::{error, IncMetric, StoreMetric, METRICS};
-use utils::signal::register_signal_handler;
+use log::error;
 
 use crate::FcExitCode;
+use crate::logger::{IncMetric, METRICS, StoreMetric};
+use crate::utils::signal::register_signal_handler;
 
 // The offset of `si_syscall` (offending syscall identifier) within the siginfo structure
 // expressed as an `(u)int*`.
@@ -24,7 +25,7 @@ fn exit_with_code(exit_code: FcExitCode) {
     if let Err(err) = METRICS.write() {
         error!("Failed to write metrics while stopping: {}", err);
     }
-    // Safe because we're terminating the process anyway.
+    // SAFETY: Safe because we're terminating the process anyway.
     unsafe { libc::_exit(exit_code as i32) };
 }
 
@@ -32,8 +33,9 @@ macro_rules! generate_handler {
     ($fn_name:ident ,$signal_name:ident, $exit_code:ident, $signal_metric:expr, $body:ident) => {
         #[inline(always)]
         extern "C" fn $fn_name(num: c_int, info: *mut siginfo_t, _unused: *mut c_void) {
-            // Safe because we're just reading some fields from a supposedly valid argument.
+            // SAFETY: Safe because we're just reading some fields from a supposedly valid argument.
             let si_signo = unsafe { (*info).si_signo };
+            // SAFETY: Safe because we're just reading some fields from a supposedly valid argument.
             let si_code = unsafe { (*info).si_code };
 
             if num != si_signo || num != $signal_name {
@@ -48,7 +50,6 @@ macro_rules! generate_handler {
 
             $body(si_code, info);
 
-            #[cfg(not(test))]
             match si_signo {
                 $signal_name => exit_with_code(crate::FcExitCode::$exit_code),
                 _ => exit_with_code(FcExitCode::UnexpectedError),
@@ -58,14 +59,14 @@ macro_rules! generate_handler {
 }
 
 fn log_sigsys_err(si_code: c_int, info: *mut siginfo_t) {
-    if si_code != SYS_SECCOMP_CODE as i32 {
+    if si_code != SYS_SECCOMP_CODE {
         // We received a SIGSYS for a reason other than `bad syscall`.
         exit_with_code(FcExitCode::UnexpectedError);
     }
 
-    // Other signals which might do async unsafe things incompatible with the rest of this
+    // SAFETY: Other signals which might do async unsafe things incompatible with the rest of this
     // function are blocked due to the sa_mask used when registering the signal handler.
-    let syscall = unsafe { *(info as *const i32).offset(SI_OFF_SYSCALL) as usize };
+    let syscall = unsafe { *(info as *const i32).offset(SI_OFF_SYSCALL) };
     error!(
         "Shutting down VM after intercepting a bad syscall ({}).",
         syscall
@@ -134,8 +135,9 @@ extern "C" fn sigpipe_handler(num: c_int, info: *mut siginfo_t, _unused: *mut c_
     // Just record the metric and allow the process to continue, the EPIPE error needs
     // to be handled at caller level.
 
-    // Safe because we're just reading some fields from a supposedly valid argument.
+    // SAFETY: Safe because we're just reading some fields from a supposedly valid argument.
     let si_signo = unsafe { (*info).si_signo };
+    // SAFETY: Safe because we're just reading some fields from a supposedly valid argument.
     let si_code = unsafe { (*info).si_code };
 
     if num != si_signo || num != SIGPIPE {
@@ -152,7 +154,7 @@ extern "C" fn sigpipe_handler(num: c_int, info: *mut siginfo_t, _unused: *mut c_
 ///
 /// Custom handlers are installed for: `SIGBUS`, `SIGSEGV`, `SIGSYS`
 /// `SIGXFSZ` `SIGXCPU` `SIGPIPE` `SIGHUP` and `SIGILL`.
-pub fn register_signal_handlers() -> utils::errno::Result<()> {
+pub fn register_signal_handlers() -> vmm_sys_util::errno::Result<()> {
     // Call to unsafe register_signal_handler which is considered unsafe because it will
     // register a signal handler which will be called in the current thread and will interrupt
     // whatever work is done on the current thread, so we have to keep in mind that the registered
@@ -166,229 +168,4 @@ pub fn register_signal_handlers() -> utils::errno::Result<()> {
     register_signal_handler(SIGHUP, sighup_handler)?;
     register_signal_handler(SIGILL, sigill_handler)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{env, process, thread};
-
-    use libc::syscall;
-    use seccompiler::sock_filter;
-
-    use super::*;
-
-    #[test]
-    fn test_signal_handler() {
-        let run_with_kcov = env::var("CARGO_WRAPPER").unwrap_or_else(|_| "".to_string()) == *"kcov";
-
-        let child = thread::spawn(move || {
-            assert!(register_signal_handlers().is_ok());
-
-            let filter = make_test_seccomp_bpf_filter();
-
-            assert!(seccompiler::apply_filter(&filter).is_ok());
-            assert_eq!(METRICS.seccomp.num_faults.fetch(), 0);
-
-            // Call the forbidden `SYS_mkdirat`.
-            unsafe { libc::syscall(libc::SYS_mkdirat, "/foo/bar\0") };
-
-            // Call SIGBUS signal handler.
-            assert_eq!(METRICS.signals.sigbus.fetch(), 0);
-            unsafe {
-                syscall(libc::SYS_kill, process::id(), SIGBUS);
-            }
-
-            // Call SIGSEGV signal handler.
-            assert_eq!(METRICS.signals.sigsegv.fetch(), 0);
-            unsafe {
-                syscall(libc::SYS_kill, process::id(), SIGSEGV);
-            }
-
-            // Call SIGXFSZ signal handler.
-            assert_eq!(METRICS.signals.sigxfsz.fetch(), 0);
-            unsafe {
-                syscall(libc::SYS_kill, process::id(), SIGXFSZ);
-            }
-
-            // Call SIGXCPU signal handler.
-            assert_eq!(METRICS.signals.sigxcpu.fetch(), 0);
-            unsafe {
-                syscall(libc::SYS_kill, process::id(), SIGXCPU);
-            }
-
-            // Call SIGPIPE signal handler.
-            assert_eq!(METRICS.signals.sigpipe.count(), 0);
-            unsafe {
-                syscall(libc::SYS_kill, process::id(), SIGPIPE);
-            }
-
-            // Call SIGHUP signal handler.
-            assert_eq!(METRICS.signals.sighup.fetch(), 0);
-            unsafe {
-                syscall(libc::SYS_kill, process::id(), SIGHUP);
-            }
-
-            // Call SIGILL signal handler.
-            assert_eq!(METRICS.signals.sigill.fetch(), 0);
-            unsafe {
-                syscall(libc::SYS_kill, process::id(), SIGILL);
-            }
-        });
-        assert!(child.join().is_ok());
-
-        // SIGSYS, which is raised whenever a bad syscall is caught will be intercepted by kcov on
-        // x86_64 and thus not reach Firecracker:
-        // https://github.com/SimonKagstrom/kcov/blob/a8b60c43fb33f56553a2bb20633e3b59a08abae1/src/engines/ptrace.cc#L187
-        // So, we are not checking for the `num_faults` metrics which gets incremented on each bad
-        // syscall if we run with kcov and we are on x86_64.
-        if !(cfg!(target_arch = "x86_64") && run_with_kcov) {
-            assert!(METRICS.seccomp.num_faults.fetch() >= 1);
-        }
-        assert!(METRICS.signals.sigbus.fetch() >= 1);
-        assert!(METRICS.signals.sigsegv.fetch() >= 1);
-        assert!(METRICS.signals.sigxfsz.fetch() >= 1);
-        assert!(METRICS.signals.sigxcpu.fetch() >= 1);
-        assert!(METRICS.signals.sigpipe.count() >= 1);
-        assert!(METRICS.signals.sighup.fetch() >= 1);
-        if !(cfg!(target_arch = "aarch64") && run_with_kcov) {
-            assert!(METRICS.signals.sigill.fetch() >= 1);
-        }
-    }
-
-    fn make_test_seccomp_bpf_filter() -> Vec<sock_filter> {
-        // Create seccomp filter that allows all syscalls, except for `SYS_mkdirat`.
-        // For some reason, directly calling `SYS_kill` with SIGSYS, like we do with the
-        // other signals, results in an error. Probably because of the way `cargo test` is
-        // handling signals.
-        #[cfg(target_arch = "aarch64")]
-        #[allow(clippy::unreadable_literal)]
-        let bpf_filter = vec![
-            sock_filter {
-                code: 32,
-                jt: 0,
-                jf: 0,
-                k: 4,
-            },
-            sock_filter {
-                code: 21,
-                jt: 1,
-                jf: 0,
-                k: 3221225655,
-            },
-            sock_filter {
-                code: 6,
-                jt: 0,
-                jf: 0,
-                k: 0,
-            },
-            sock_filter {
-                code: 32,
-                jt: 0,
-                jf: 0,
-                k: 0,
-            },
-            sock_filter {
-                code: 21,
-                jt: 0,
-                jf: 1,
-                k: 34,
-            },
-            sock_filter {
-                code: 5,
-                jt: 0,
-                jf: 0,
-                k: 1,
-            },
-            sock_filter {
-                code: 5,
-                jt: 0,
-                jf: 0,
-                k: 2,
-            },
-            sock_filter {
-                code: 6,
-                jt: 0,
-                jf: 0,
-                k: 196608,
-            },
-            sock_filter {
-                code: 6,
-                jt: 0,
-                jf: 0,
-                k: 2147418112,
-            },
-            sock_filter {
-                code: 6,
-                jt: 0,
-                jf: 0,
-                k: 2147418112,
-            },
-        ];
-        #[cfg(target_arch = "x86_64")]
-        #[allow(clippy::unreadable_literal)]
-        let bpf_filter = vec![
-            sock_filter {
-                code: 32,
-                jt: 0,
-                jf: 0,
-                k: 4,
-            },
-            sock_filter {
-                code: 21,
-                jt: 1,
-                jf: 0,
-                k: 3221225534,
-            },
-            sock_filter {
-                code: 6,
-                jt: 0,
-                jf: 0,
-                k: 0,
-            },
-            sock_filter {
-                code: 32,
-                jt: 0,
-                jf: 0,
-                k: 0,
-            },
-            sock_filter {
-                code: 21,
-                jt: 0,
-                jf: 1,
-                k: 258,
-            },
-            sock_filter {
-                code: 5,
-                jt: 0,
-                jf: 0,
-                k: 1,
-            },
-            sock_filter {
-                code: 5,
-                jt: 0,
-                jf: 0,
-                k: 2,
-            },
-            sock_filter {
-                code: 6,
-                jt: 0,
-                jf: 0,
-                k: 196608,
-            },
-            sock_filter {
-                code: 6,
-                jt: 0,
-                jf: 0,
-                k: 2147418112,
-            },
-            sock_filter {
-                code: 6,
-                jt: 0,
-                jf: 0,
-                k: 2147418112,
-            },
-        ];
-
-        bpf_filter
-    }
 }

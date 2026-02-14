@@ -2,42 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """Ensure multiple microVMs work correctly when spawned simultaneously."""
 
-from framework import decorators
-
-import host_tools.network as net_tools
+from concurrent.futures import ThreadPoolExecutor
 
 NO_OF_MICROVMS = 20
 
 
-@decorators.test_context("api", NO_OF_MICROVMS)
-def test_run_concurrency(test_multiple_microvms, network_config):
+def test_run_concurrency(microvm_factory, guest_kernel, rootfs, pci_enabled):
     """
     Check we can spawn multiple microvms.
-
-    @type: functional
     """
-    microvms = test_multiple_microvms
 
-    for i in range(NO_OF_MICROVMS):
-        microvm = microvms[i]
-        _ = _configure_and_run(microvm, {"config": network_config, "iface_id": str(i)})
-        # We check that the vm is running by testing that the ssh does
-        # not time out.
-        _ = net_tools.SSHConnection(microvm.ssh_config)
+    def launch1():
+        microvm = microvm_factory.build(guest_kernel, rootfs, pci=pci_enabled)
+        microvm.time_api_requests = False  # is flaky because of parallelism
+        microvm.spawn()
+        microvm.basic_config(vcpu_count=1, mem_size_mib=128)
+        microvm.add_net_iface()
+        microvm.start()
 
-
-def _configure_and_run(microvm, network_info):
-    """Auxiliary function for configuring and running microVM."""
-    microvm.spawn()
-
-    # Machine configuration specified in the SLA.
-    config = {"vcpu_count": 1, "mem_size_mib": 128}
-
-    microvm.basic_config(**config)
-
-    _tap, _, _ = microvm.ssh_network_config(
-        network_info["config"], network_info["iface_id"]
-    )
-
-    microvm.start()
-    return _tap
+    with ThreadPoolExecutor(max_workers=NO_OF_MICROVMS) as tpe:
+        for _ in range(NO_OF_MICROVMS):
+            tpe.submit(launch1)

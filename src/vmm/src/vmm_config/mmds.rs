@@ -1,12 +1,11 @@
 // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
-
-use std::fmt::{Display, Formatter, Result};
 use std::net::Ipv4Addr;
 
-use mmds::data_store;
-use mmds::data_store::MmdsVersion;
 use serde::{Deserialize, Serialize};
+
+use crate::mmds::data_store;
+use crate::mmds::data_store::MmdsVersion;
 
 /// Keeps the MMDS configuration.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -19,6 +18,9 @@ pub struct MmdsConfig {
     pub network_interfaces: Vec<String>,
     /// MMDS IPv4 configured address.
     pub ipv4_address: Option<Ipv4Addr>,
+    /// Compatibility with EC2 IMDS.
+    #[serde(default)]
+    pub imds_compat: bool,
 }
 
 impl MmdsConfig {
@@ -40,46 +42,15 @@ impl MmdsConfig {
 }
 
 /// MMDS configuration related errors.
-#[derive(Debug)]
+#[rustfmt::skip]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum MmdsConfigError {
-    /// The network interfaces list provided is empty.
+    /// The list of network interface IDs that allow forwarding MMDS requests is empty.
     EmptyNetworkIfaceList,
-    /// The provided IPv4 address is not link-local valid.
+    /// The MMDS IPv4 address is not link local.
     InvalidIpv4Addr,
-    /// The network interfaces list provided contains IDs that
-    /// does not correspond to any existing network interface.
+    /// The list of network interface IDs provided contains at least one ID that does not correspond to any existing network interface.
     InvalidNetworkInterfaceId,
-    /// MMDS version could not be configured.
-    MmdsVersion(MmdsVersion, data_store::Error),
-}
-
-impl Display for MmdsConfigError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        match self {
-            MmdsConfigError::EmptyNetworkIfaceList => {
-                write!(
-                    f,
-                    "The list of network interface IDs that allow forwarding MMDS requests is \
-                     empty."
-                )
-            }
-            MmdsConfigError::InvalidIpv4Addr => {
-                write!(f, "The MMDS IPv4 address is not link local.")
-            }
-            MmdsConfigError::InvalidNetworkInterfaceId => {
-                write!(
-                    f,
-                    "The list of network interface IDs provided contains at least one ID that \
-                     does not correspond to any existing network interface."
-                )
-            }
-            MmdsConfigError::MmdsVersion(version, err) => {
-                write!(
-                    f,
-                    "The MMDS could not be configured to version {}: {}",
-                    version, err
-                )
-            }
-        }
-    }
+    /// Failed to initialize MMDS data store: {0}
+    InitMmdsDatastore(#[from] data_store::MmdsDatastoreError),
 }

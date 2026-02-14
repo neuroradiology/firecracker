@@ -2,16 +2,20 @@
 name = "utils"
 version = "0.1.0"
 authors = ["Amazon Firecracker team <firecracker-devel@amazon.com>"]
-edition = "2018"
+edition = "2024"
 license = "Apache-2.0"
 
+[lib]
+bench = false
+
+[features]
+tracing = ["log-instrument"]
+
 [dependencies]
-libc = ">=0.2.39"
-serde = { version = ">=1.0.27", features = ["derive"] }
-vmm-sys-util = ">=0.8.0"
-derive_more = { version = "0.99.17", default-features = false, features = ["from"] }
+displaydoc = "0.2.5"
+libc = "0.2.180"
+log-instrument = { path = "../log-instrument", optional = true }
+thiserror = "2.0.18"
 
-net_gen = { path = "../net_gen" }
-
-[dev-dependencies]
-serde_json = ">=1.0.9"
+[lints]
+workspace = true

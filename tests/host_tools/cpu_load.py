@@ -3,13 +3,10 @@
 """Utilities for measuring cpu utilisation for a process."""
 import time
 from threading import Thread
-from framework import utils
 
-# /proc/<pid>/stat output taken from
-# https://www.man7.org/linux/man-pages/man5/proc.5.html
-STAT_UTIME_IDX = 13
-STAT_STIME_IDX = 14
-STAT_STARTTIME_IDX = 21
+import psutil
+
+from framework import utils
 
 
 class CpuLoadExceededException(Exception):
@@ -66,13 +63,35 @@ class CpuLoadMonitor(Thread):
 
         It is up to the caller to check the queue.
         """
+        process = psutil.Process(self._process_pid)
         while not self._should_stop:
-            cpu_load = utils.ProcessManager.get_cpu_percent(self._process_pid)["real"]
-            if cpu_load > self.threshold:
-                self.cpu_load_samples.append(cpu_load)
-            time.sleep(1)  # 1 second granularity.
+            utilization = utils.get_cpu_utilization(process)
+
+            try:
+                fc_thread_util = utilization["firecracker"]
+                if fc_thread_util > self._threshold:
+                    self._cpu_load_samples.append(fc_thread_util)
+            except KeyError:
+                pass  # no firecracker process
+
+            time.sleep(0.05)  # 50 milliseconds granularity.
 
     def check_samples(self):
         """Check that there are no samples above the threshold."""
         if len(self.cpu_load_samples) > 0:
             raise CpuLoadExceededException(self._cpu_load_samples, self._threshold)
+
+    def __enter__(self):
+        """Functions to use this CPU Load class as a Context Manager
+
+        >>> clm = CpuLoadMonitor(1000, 1000, 45)
+        >>> with clm:
+        >>>    # do stuff
+        """
+        self.start()
+
+    def __exit__(self, _type, _value, _traceback):
+        """Exit context"""
+        self.check_samples()
+        self.signal_stop()
+        self.join()

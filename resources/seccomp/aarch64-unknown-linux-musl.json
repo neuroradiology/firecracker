@@ -4,6 +4,10 @@
         "filter_action": "allow",
         "filter": [
             {
+                "syscall": "newfstatat",
+                "comment": "Used when creating snapshots in vmm:persist::snapshot_memory_to_file through std::fs::File::metadata"
+            },
+            {
                 "syscall": "epoll_ctl"
             },
             {
@@ -25,14 +29,21 @@
                 "syscall": "write"
             },
             {
+                "syscall": "mincore"
+            },
+            {
+                "syscall": "writev",
+                "comment": "Used by the VirtIO net device to write to tap"
+            },
+            {
+                "syscall": "readv",
+                "comment": "Used by the VirtIO net device to read from tap"
+            },
+            {
                 "syscall": "fsync"
             },
             {
                 "syscall": "close"
-            },
-            {
-                "syscall": "uname",
-                "comment": "Used for getting the kernel version, for validating io_uring support"
             },
             {
                 "syscall": "eventfd2",
@@ -53,6 +64,10 @@
             {
                 "syscall": "brk",
                 "comment": "Called for expanding the heap"
+            },
+            {
+                "syscall": "gettid",
+                "comment": "Rust std uses it during panic to print the thread id."
             },
             {
                 "syscall": "clock_gettime",
@@ -97,6 +112,10 @@
             {
                 "syscall": "sigaltstack",
                 "comment": "sigaltstack is used by Rust stdlib to remove alternative signal stack during thread teardown."
+            },
+            {
+              "syscall": "getrandom",
+              "comment": "getrandom is used by aws-lc library which we consume in virtio-rng"
             },
             {
                 "syscall": "accept4",
@@ -198,14 +217,18 @@
             },
             {
                 "syscall": "madvise",
-                "comment": "Used by the VirtIO balloon device and by musl for some customer workloads",
+                "comment": "Used by the VirtIO balloon device and by musl for some customer workloads. It is also used by aws-lc during random number generation. They setup a memory page that mark with MADV_WIPEONFORK to be able to detect forks. They also call it with -1 to see if madvise is supported in certain platforms." 
+            },
+            {
+                "syscall": "msync",
+                "comment": "Used by the VirtIO pmem device to sync the file content with the backing file.",
                 "args": [
                     {
                         "index": 2,
                         "type": "dword",
                         "op": "eq",
                         "val": 4,
-                        "comment": "libc::MADV_DONTNEED"
+                        "comment": "libc::MS_SYNC"
                     }
                 ]
             },
@@ -299,6 +322,10 @@
                         "val": 0
                     }
                 ]
+            },
+            {
+                "syscall": "sendto",
+                "comment": "Rust std uses it to write to unix socket"
             },
             {
                 "syscall": "tkill",
@@ -425,6 +452,38 @@
                         "comment": "KVM_GET_DEVICE_ATTR"
                     }
                 ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1075883590,
+                        "comment": "KVM_SET_USER_MEMORY_REGION, used to (un)plug memory for the virtio-mem device"
+                    }
+                ]
+            },
+            {
+                "syscall": "sched_yield",
+                "comment": "Used by the rust standard library in std::sync::mpmc. Firecracker uses mpsc channels from this module for inter-thread communication"
+            },
+            {
+                "syscall": "sendmsg",
+                "comment": "Used by vhost-user frontend to communicate with the backend"
+            },
+            {
+                "syscall": "recvmsg",
+                "comment": "Used by vhost-user frontend to read response from the backend"
+            },
+            {
+                "syscall": "restart_syscall",
+                "comment": "automatically issued by the kernel when specific timing-related syscalls (e.g. nanosleep) get interrupted by SIGSTOP"
+            },
+            {
+                "syscall": "mprotect",
+                "comment": "Used by memory hotplug to protect access to underlying host memory"
             }
         ]
     },
@@ -461,6 +520,10 @@
                 "comment": "Called for expanding the heap"
             },
             {
+                "syscall": "gettid",
+                "comment": "Rust std uses it during panic to print the thread id."
+            },
+            {
                 "syscall": "clock_gettime",
                 "comment": "Used for metrics and logging, via the helpers in utils/src/time.rs. It's not called on some platforms, because of vdso optimisations."
             },
@@ -491,6 +554,10 @@
             {
                 "syscall": "sigaltstack",
                 "comment": "sigaltstack is used by Rust stdlib to remove alternative signal stack during thread teardown."
+            },
+            {
+              "syscall": "getrandom",
+              "comment": "getrandom is used by `HttpServer` to reinialize `HashMap` after moving to the API thread"
             },
             {
                 "syscall": "accept4",
@@ -662,6 +729,10 @@
                 ]
             },
             {
+                "syscall": "sendto",
+                "comment": "Rust std uses it to write to unix socket"
+            },
+            {
                 "syscall": "tkill",
                 "comment": "tkill is used by libc::abort during a panic to raise SIGABRT",
                 "args": [
@@ -686,6 +757,14 @@
                         "comment": "FIONBIO"
                     }
                 ]
+            },
+            {
+                "syscall": "sched_yield",
+                "comment": "Used by the rust standard library in std::sync::mpmc. Firecracker uses mpsc channels from this module for inter-thread communication"
+            },
+            {
+                "syscall": "restart_syscall",
+                "comment": "automatically issued by the kernel when specific timing-related syscalls (e.g. nanosleep) get interrupted by SIGSTOP"
             }
         ]
     },
@@ -715,6 +794,10 @@
             {
                 "syscall": "brk",
                 "comment": "Called for expanding the heap"
+            },
+            {
+                "syscall": "gettid",
+                "comment": "Rust std uses it during panic to print the thread id."
             },
             {
                 "syscall": "clock_gettime",
@@ -832,6 +915,26 @@
                 ]
             },
             {
+                "syscall": "mmap",
+                "comment": "Used for allocating memory for FamStructWrapper called by KvmCpu::get_cpuid",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 34,
+                        "comment": "libc::MAP_ANONYMOUS|libc::MAP_PRIVATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3,
+                        "comment": "libc::PROT_READ|libc::PROT_WRITE"
+                    }
+                ]
+            },
+            {
                 "syscall": "rt_sigaction",
                 "comment": "rt_sigaction is used by libc::abort during a panic to install the default handler for SIGABRT",
                 "args": [
@@ -900,42 +1003,6 @@
                         "index": 1,
                         "type": "dword",
                         "op": "eq",
-                        "val": 1074048665,
-                        "comment": "KVM_SET_MP_STATE"
-                    }
-                ]
-            },
-            {
-                "syscall": "ioctl",
-                "args": [
-                    {
-                        "index": 1,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 2151722655,
-                        "comment": "KVM_GET_VCPU_EVENTS"
-                    }
-                ]
-            },
-            {
-                "syscall": "ioctl",
-                "args": [
-                    {
-                        "index": 1,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 1077980832,
-                        "comment": "KVM_SET_VCPU_EVENTS"
-                    }
-                ]
-            },
-            {
-                "syscall": "ioctl",
-                "args": [
-                    {
-                        "index": 1,
-                        "type": "dword",
-                        "op": "eq",
                         "val": 1074835115,
                         "comment": "KVM_GET_ONE_REG"
                     }
@@ -948,8 +1015,8 @@
                         "index": 1,
                         "type": "dword",
                         "op": "eq",
-                        "val": 1074835116,
-                        "comment": "KVM_SET_ONE_REG"
+                        "val": 3221794480,
+                        "comment": "KVM_GET_REG_LIST"
                     }
                 ]
             },
@@ -960,8 +1027,63 @@
                         "index": 1,
                         "type": "dword",
                         "op": "eq",
-                        "val": 3221794480,
-                        "comment": "KVM_GET_REG_LIST"
+                        "val": 1074025680,
+                        "comment": "TUNSETOFFLOAD"
+                    }
+                ]
+            },
+            {
+                "syscall": "sched_yield",
+                "comment": "Used by the rust standard library in std::sync::mpmc. Firecracker uses mpsc channels from this module for inter-thread communication"
+            },
+            {
+                "syscall": "sendmsg",
+                "comment": "Used by vhost-user frontend to communicate with the backend"
+            },
+            {
+                "syscall": "restart_syscall",
+                "comment": "automatically issued by the kernel when specific timing-related syscalls (e.g. nanosleep) get interrupted by SIGSTOP"
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 44547,
+                        "comment": "KVM_CHECK_EXTENSION"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 131,
+                        "comment": "KVM_CAP_MSI_DEVID"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074310762,
+                        "comment": "KVM_SET_GSI_ROUTING"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1075883638,
+                        "comment": "KVM_IRQFD"
                     }
                 ]
             }
